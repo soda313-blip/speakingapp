@@ -6,7 +6,6 @@ import {
   RotateCcw,
   ArrowRight,
   Star,
-  CheckCircle2,
   AlertTriangle,
   Sparkles,
   Play,
@@ -28,6 +27,11 @@ import {
   PartnerAvatar,
   CoachAvatar,
 } from "./components/Illustrations";
+import {
+  generateFeedbackClientSide,
+  getFallbackFeedback,
+  transcribePcmAudioClientSide,
+} from "./services/geminiClient";
 
 type ScreenMode = "start" | "practice" | "result";
 type MicState = "ready" | "listening" | "processing";
@@ -105,6 +109,7 @@ declare global {
   interface Window {
     SpeechRecognition?: new () => SpeechRecognitionInstance;
     webkitSpeechRecognition?: new () => SpeechRecognitionInstance;
+    webkitAudioContext?: typeof AudioContext;
   }
 }
 
@@ -117,14 +122,18 @@ export default function App() {
   const [selectedFood, setSelectedFood] = useState<FoodId>("pizza");
   const [selectedReason, setSelectedReason] = useState<ReasonId | null>(null);
   const [hasChosenFood, setHasChosenFood] = useState<boolean>(true);
-  const [hasCreatedTargetSentence, setHasCreatedTargetSentence] = useState<boolean>(false);
+  const [hasCreatedTargetSentence, setHasCreatedTargetSentence] =
+    useState<boolean>(false);
 
   // Speech & Audio state
   const [micState, setMicState] = useState<MicState>("ready");
+  const [micLevel, setMicLevel] = useState<number>(0);
   const [isPlayingAudio, setIsPlayingAudio] = useState<boolean>(false);
   const [liveTranscript, setLiveTranscript] = useState<string>("");
   const [consecutiveFailures, setConsecutiveFailures] = useState<number>(0);
-  const [currentFeedback, setCurrentFeedback] = useState<FeedbackData | null>(null);
+  const [currentFeedback, setCurrentFeedback] = useState<FeedbackData | null>(
+    null
+  );
   const [matchedKeywords, setMatchedKeywords] = useState<string[]>([]);
 
   // Completed turn records for Screen 3 Result Screen
@@ -133,18 +142,24 @@ export default function App() {
   // Browser & Mic environment checks
   const [speechSupported, setSpeechSupported] = useState<boolean>(true);
   const [isInAppBrowser, setIsInAppBrowser] = useState<boolean>(false);
-  const [micPermissionDenied, setMicPermissionDenied] = useState<boolean>(false);
+  const [micPermissionDenied, setMicPermissionDenied] =
+    useState<boolean>(false);
   const [showManualInput, setShowManualInput] = useState<boolean>(false);
   const [manualTextInput, setManualTextInput] = useState<string>("");
 
-  // Refs for Web Speech API and timers
+  // Refs for Web Speech API, PCM AudioContext pipeline, and timers
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const pcmChunksRef = useRef<Float32Array[]>([]);
+  const hadVoiceActivityRef = useRef<boolean>(false);
+
   const silenceTimerRef = useRef<number | null>(null);
   const initialWaitTimerRef = useRef<number | null>(null);
   const transcriptAccumulatorRef = useRef<string>("");
   const alternativesAccumulatorRef = useRef<string[]>([]);
-  const hasProcessedRef = useRef<boolean>(false);
-  const errorOccurredRef = useRef<string | null>(null);
+  const isStoppingRef = useRef<boolean>(false);
 
   const partner = PARTNER_PROFILES[partnerIndex];
   const stepConfig = DIALOGUE_STEPS[currentStep - 1] || DIALOGUE_STEPS[0];
@@ -157,28 +172,17 @@ export default function App() {
     selectedReason
   );
 
-  // Keep latest callback refs so recognition.onend always uses fresh state
-  const processSpokenAttemptRef = useRef<
-    (
-      spoken: string,
-      alternatives?: string[],
-      forcedSituation?:
-        | "success"
-        | "partial"
-        | "fail_1_recast"
-        | "fail_2_elicitation"
-        | "fail_3_chunking"
-        | "no_speech"
-    ) => Promise<void>
-  >(async () => {});
-
   useEffect(() => {
     const ua = navigator.userAgent || "";
     const inApp = /KAKAOTALK|Instagram|FBAN|FBAV|Line|NAVER/i.test(ua);
     setIsInAppBrowser(inApp);
 
-    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRec) {
+    const SpeechRec =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    const hasGetUserMedia = !!(
+      navigator.mediaDevices && navigator.mediaDevices.getUserMedia
+    );
+    if (!SpeechRec && !hasGetUserMedia) {
       setSpeechSupported(false);
     }
 
@@ -196,9 +200,39 @@ export default function App() {
     }
   }, []);
 
+  const cleanupAudioPipeline = useCallback(() => {
+    setMicLevel(0);
+    if (scriptProcessorRef.current) {
+      try {
+        scriptProcessorRef.current.disconnect();
+        scriptProcessorRef.current.onaudioprocess = null;
+      } catch {
+        // ignore
+      }
+      scriptProcessorRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      try {
+        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+      } catch {
+        // ignore
+      }
+      mediaStreamRef.current = null;
+    }
+    if (audioCtxRef.current) {
+      try {
+        audioCtxRef.current.close();
+      } catch {
+        // ignore
+      }
+      audioCtxRef.current = null;
+    }
+  }, []);
+
   const initializeStepDefaults = useCallback(
     (stepNum: number) => {
       clearAllTimers();
+      cleanupAudioPipeline();
       if (recognitionRef.current) {
         try {
           recognitionRef.current.abort();
@@ -216,12 +250,15 @@ export default function App() {
       setLiveTranscript("");
       transcriptAccumulatorRef.current = "";
       alternativesAccumulatorRef.current = [];
+      pcmChunksRef.current = [];
+      hadVoiceActivityRef.current = false;
+      isStoppingRef.current = false;
       setCurrentFeedback(null);
       setConsecutiveFailures(0);
       setMatchedKeywords([]);
       setMicState("ready");
     },
-    [clearAllTimers]
+    [cleanupAudioPipeline, clearAllTimers]
   );
 
   const speakText = useCallback(
@@ -229,18 +266,23 @@ export default function App() {
       if (!("speechSynthesis" in window)) return;
       if (micState === "listening") return;
 
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = "en-US";
-      utterance.rate = rate;
-      utterance.pitch = 1.0;
+      try {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = "en-US";
+        utterance.rate = rate;
+        utterance.pitch = 1.0;
 
-      utterance.onstart = () => setIsPlayingAudio(true);
-      utterance.onend = () => setIsPlayingAudio(false);
-      utterance.onerror = () => setIsPlayingAudio(false);
+        utterance.onstart = () => setIsPlayingAudio(true);
+        utterance.onend = () => setIsPlayingAudio(false);
+        utterance.onerror = () => setIsPlayingAudio(false);
 
-      setIsPlayingAudio(true);
-      window.speechSynthesis.speak(utterance);
+        setIsPlayingAudio(true);
+        window.speechSynthesis.speak(utterance);
+      } catch (err) {
+        console.warn("Non-critical speech synthesis error skipped:", err);
+        setIsPlayingAudio(false);
+      }
     },
     [micState]
   );
@@ -251,6 +293,7 @@ export default function App() {
         window.speechSynthesis.cancel();
       }
       clearAllTimers();
+      cleanupAudioPipeline();
       if (recognitionRef.current) {
         try {
           recognitionRef.current.abort();
@@ -259,8 +302,9 @@ export default function App() {
         }
       }
     };
-  }, [clearAllTimers]);
+  }, [cleanupAudioPipeline, clearAllTimers]);
 
+  // Pure client-side evaluation & feedback generator (never makes a backend /api/feedback request)
   const processSpokenAttempt = useCallback(
     async (
       spoken: string,
@@ -320,133 +364,52 @@ export default function App() {
       setMatchedKeywords(computedMatched);
 
       const partnerQ = stepConfig.partnerLine(currentFoodObj);
+      const feedbackReq = {
+        situation,
+        targetSentence: dynamicTarget.sentence,
+        spokenText: spoken,
+        missingKeywords: computedMissing,
+        matchedKeywords: computedMatched,
+        partnerQuestion: partnerQ,
+      };
 
+      let fb: FeedbackData;
       try {
-        const res = await fetch("/api/feedback", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            situation,
-            targetSentence: dynamicTarget.sentence,
-            spokenText: spoken,
-            missingKeywords: computedMissing,
-            matchedKeywords: computedMatched,
-            partnerQuestion: partnerQ,
-          }),
-        });
-
-        if (!res.ok) throw new Error("Server error");
-        const data = await res.json();
-        const fb: FeedbackData = {
-          english: data.english,
-          korean: data.korean,
-          combined: data.combined,
-          strategyLabel: data.strategyLabel,
+        const res = await generateFeedbackClientSide(feedbackReq);
+        fb = {
+          ...res,
           situation,
-          source: data.source,
         };
-        setCurrentFeedback(fb);
-
-        const record: TurnRecord = {
-          step: currentStep,
-          partnerQuestion: partnerQ,
-          targetSentence: dynamicTarget.sentence,
-          koreanMeaning: dynamicTarget.korean,
-          spokenText: spoken.trim() || "(No speech detected)",
-          matchedKeywords: computedMatched,
-          missingKeywords: computedMissing,
-          feedback: fb,
-          foodId: selectedFood,
-          reasonId: selectedReason,
-        };
-
-        setTurnRecords((prev) => {
-          const filtered = prev.filter((r) => r.step !== currentStep);
-          return [...filtered, record].sort((a, b) => a.step - b.step);
-        });
-      } catch {
-        const firstMissing = computedMissing[0] || "because";
-        const firstLetter = firstMissing.charAt(0).toLowerCase();
-        const upperLetter = firstMissing.charAt(0).toUpperCase();
-        const maskedSentence = dynamicTarget.sentence.replace(
-          new RegExp(`\\b${firstMissing}\\b`, "i"),
-          `${firstLetter}__`
-        );
-        const words = dynamicTarget.sentence
-          .replace(/[.!?]+$/, "")
-          .split(/\s+/);
-        const chunkWords =
-          words.length > 3 ? words.slice(-4).join(" ") : words.join(" ");
-
-        const fallbackMap: Record<
-          string,
-          { english: string; korean: string; label: string }
-        > = {
-          success: {
-            english: "Great job I understood your point.",
-            korean: "잘했어 네가 뭐라고 말하는지 이해했어.",
-            label: "Success",
-          },
-          partial: {
-            english: "Good job just remember these words next time.",
-            korean: "잘했는데 다음엔 이 단어들을 잊지마.",
-            label: "Good job",
-          },
-          fail_1_recast: {
-            english: `Nice try but this time can you say: "${dynamicTarget.sentence}"`,
-            korean: "잘했는데 이번에는 이렇게 말해 볼까?",
-            label: "1st failure (recast)",
-          },
-          fail_2_elicitation: {
-            english: `Nice try but when reasoning you need to use a word that starts with ${upperLetter}. "${maskedSentence}"`,
-            korean: `'이유'를 말할 땐 ${firstLetter}로 시작하는 단어가 필요해.`,
-            label: "2nd failure (elicitation)",
-          },
-          fail_3_chunking: {
-            english: `Let's try saying it in short chunks. Repeat after me: "${chunkWords}."`,
-            korean: "이번에는 짧게 나눠서 따라 말해보자",
-            label: "3rd failure (chunking)",
-          },
-          no_speech: {
-            english:
-              "I couldn't hear you, could you tap the mic and try speaking again?",
-            korean: "소리가 안들렸어. 마이크를 누르고 다시 말해 주겠어?",
-            label: "No speech recognized",
-          },
-        };
-
-        const item = fallbackMap[situation] || fallbackMap.no_speech;
-        const fb: FeedbackData = {
-          english: item.english,
-          korean: item.korean,
-          combined: `${item.english} (${item.korean})`,
-          strategyLabel: item.label,
+      } catch (err) {
+        console.warn("Non-critical fetch skipped:", err);
+        const fallback = getFallbackFeedback(feedbackReq);
+        fb = {
+          ...fallback,
           situation,
-          source: "table_fallback",
         };
-        setCurrentFeedback(fb);
-
-        setTurnRecords((prev) => {
-          const filtered = prev.filter((r) => r.step !== currentStep);
-          return [
-            ...filtered,
-            {
-              step: currentStep,
-              partnerQuestion: partnerQ,
-              targetSentence: dynamicTarget.sentence,
-              koreanMeaning: dynamicTarget.korean,
-              spokenText: spoken.trim() || "(No speech detected)",
-              matchedKeywords: computedMatched,
-              missingKeywords: computedMissing,
-              feedback: fb,
-              foodId: selectedFood,
-              reasonId: selectedReason,
-            },
-          ].sort((a, b) => a.step - b.step);
-        });
-      } finally {
-        setMicState("ready");
       }
+
+      setCurrentFeedback(fb);
+
+      const record: TurnRecord = {
+        step: currentStep,
+        partnerQuestion: partnerQ,
+        targetSentence: dynamicTarget.sentence,
+        koreanMeaning: dynamicTarget.korean,
+        spokenText: spoken.trim() || "(No speech detected)",
+        matchedKeywords: computedMatched,
+        missingKeywords: computedMissing,
+        feedback: fb,
+        foodId: selectedFood,
+        reasonId: selectedReason,
+      };
+
+      setTurnRecords((prev) => {
+        const filtered = prev.filter((r) => r.step !== currentStep);
+        return [...filtered, record].sort((a, b) => a.step - b.step);
+      });
+
+      setMicState("ready");
     },
     [
       consecutiveFailures,
@@ -459,37 +422,86 @@ export default function App() {
     ]
   );
 
-  useEffect(() => {
-    processSpokenAttemptRef.current = processSpokenAttempt;
-  }, [processSpokenAttempt]);
+  const finalizeRecordingSession = useCallback(async () => {
+    if (isStoppingRef.current) return;
+    isStoppingRef.current = true;
 
-  const stopListening = useCallback(() => {
     clearAllTimers();
+
     if (recognitionRef.current) {
       try {
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onerror = null;
         recognitionRef.current.stop();
       } catch {
         // ignore
       }
+      recognitionRef.current = null;
     }
-  }, [clearAllTimers]);
 
-  const handleMicToggle = useCallback(() => {
+    // Snapshot captured PCM chunks before closing AudioContext
+    const chunks = pcmChunksRef.current;
+    const totalLength = chunks.reduce((acc, c) => acc + c.length, 0);
+    const mergedPcm = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      mergedPcm.set(chunk, offset);
+      offset += chunk.length;
+    }
+    const sampleRate = audioCtxRef.current?.sampleRate || 16000;
+    const hadVoice = hadVoiceActivityRef.current;
+
+    cleanupAudioPipeline();
+    setMicState("processing");
+
+    let finalSpoken = transcriptAccumulatorRef.current.trim();
+    const alts = alternativesAccumulatorRef.current;
+
+    // Standalone Voice Fallback: if browser SpeechRecognition produced no text
+    // (e.g. inside an iframe), transcribe the captured PCM audio directly client-side via Gemini SDK.
+    if (!finalSpoken && hadVoice && mergedPcm.length > sampleRate * 0.25) {
+      try {
+        const geminiTranscript = await transcribePcmAudioClientSide(
+          mergedPcm,
+          sampleRate,
+          dynamicTarget.sentence
+        );
+        if (geminiTranscript) {
+          finalSpoken = geminiTranscript;
+          setLiveTranscript(finalSpoken);
+        }
+      } catch (err) {
+        console.warn("Non-critical fetch skipped:", err);
+      }
+    }
+
+    if (!finalSpoken) {
+      await processSpokenAttempt("", [], "no_speech");
+    } else {
+      setLiveTranscript(finalSpoken);
+      await processSpokenAttempt(finalSpoken, alts);
+    }
+  }, [
+    cleanupAudioPipeline,
+    clearAllTimers,
+    dynamicTarget.sentence,
+    processSpokenAttempt,
+  ]);
+
+  const finalizeRecordingRef = useRef(finalizeRecordingSession);
+  useEffect(() => {
+    finalizeRecordingRef.current = finalizeRecordingSession;
+  }, [finalizeRecordingSession]);
+
+  const handleMicToggle = useCallback(async () => {
     if (isPlayingAudio) return;
 
     if (micState === "listening") {
-      stopListening();
+      await finalizeRecordingRef.current();
       return;
     }
 
     if (micState === "processing") return;
-
-    const SpeechRec =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRec) {
-      setSpeechSupported(false);
-      return;
-    }
 
     if ("speechSynthesis" in window) {
       window.speechSynthesis.cancel();
@@ -497,6 +509,7 @@ export default function App() {
     }
 
     clearAllTimers();
+    cleanupAudioPipeline();
     if (recognitionRef.current) {
       try {
         recognitionRef.current.abort();
@@ -509,19 +522,14 @@ export default function App() {
     setLiveTranscript("");
     transcriptAccumulatorRef.current = "";
     alternativesAccumulatorRef.current = [];
-    hasProcessedRef.current = false;
-    errorOccurredRef.current = null;
+    pcmChunksRef.current = [];
+    hadVoiceActivityRef.current = false;
+    isStoppingRef.current = false;
     setCurrentFeedback(null);
     setMicPermissionDenied(false);
+    setMicState("listening");
 
-    const recognition = new SpeechRec();
-    recognition.lang = "en-US";
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 3;
-    recognitionRef.current = recognition;
-
-    // Only start the 3-second silence countdown AFTER the user has started speaking
+    // Reset the 3-second post-speech silence timer whenever speech or voice energy is detected
     const resetPostSpeechSilenceTimer = () => {
       if (initialWaitTimerRef.current) {
         window.clearTimeout(initialWaitTimerRef.current);
@@ -531,108 +539,154 @@ export default function App() {
         window.clearTimeout(silenceTimerRef.current);
       }
       silenceTimerRef.current = window.setTimeout(() => {
-        if (recognitionRef.current) {
-          try {
-            recognitionRef.current.stop();
-          } catch {
-            // ignore
-          }
-        }
+        finalizeRecordingRef.current();
       }, 3000);
     };
 
-    recognition.onstart = () => {
-      setMicState("listening");
-      // Once mic permission is granted and audio stream is open, allow up to 12s to begin speaking
-      if (initialWaitTimerRef.current) {
-        window.clearTimeout(initialWaitTimerRef.current);
-      }
-      initialWaitTimerRef.current = window.setTimeout(() => {
-        if (!transcriptAccumulatorRef.current.trim() && recognitionRef.current) {
-          try {
-            recognitionRef.current.stop();
-          } catch {
-            // ignore
-          }
+    // 1. Start standalone client-side PCM audio capture for live mic level meter + voice activity + fallback transcription
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+
+        // Guard if user already stopped while waiting for permission
+        if (isStoppingRef.current) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
         }
-      }, 12000);
-    };
 
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
-      let interim = "";
-      let finalStr = "";
-      const altList: string[] = [];
+        mediaStreamRef.current = stream;
+        const AudioContextClass =
+          window.AudioContext || window.webkitAudioContext;
+        if (AudioContextClass) {
+          const audioCtx = new AudioContextClass({ sampleRate: 16000 });
+          audioCtxRef.current = audioCtx;
+          const source = audioCtx.createMediaStreamSource(stream);
+          const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+          scriptProcessorRef.current = processor;
 
-      for (let i = 0; i < event.results.length; i++) {
-        const res = event.results[i];
-        const primaryTranscript = res[0]?.transcript || "";
-        if (res.isFinal) {
-          finalStr += primaryTranscript + " ";
-        } else {
-          interim += primaryTranscript + " ";
+          processor.onaudioprocess = (e) => {
+            if (isStoppingRef.current) return;
+            const inputData = e.inputBuffer.getChannelData(0);
+            const copy = new Float32Array(inputData.length);
+            copy.set(inputData);
+            pcmChunksRef.current.push(copy);
+
+            // Compute RMS level for visual feedback and voice activity detection
+            let sumSquares = 0;
+            for (let i = 0; i < inputData.length; i++) {
+              sumSquares += inputData[i] * inputData[i];
+            }
+            const rms = Math.sqrt(sumSquares / inputData.length);
+            const normalizedLevel = Math.min(1, rms * 8);
+            setMicLevel(normalizedLevel);
+
+            if (rms > 0.02) {
+              hadVoiceActivityRef.current = true;
+              resetPostSpeechSilenceTimer();
+            }
+          };
+
+          source.connect(processor);
+          processor.connect(audioCtx.destination);
         }
-        for (let a = 0; a < res.length; a++) {
-          if (res[a]?.transcript) {
-            altList.push(res[a].transcript);
-          }
-        }
-      }
-
-      const combined = (finalStr + interim).replace(/\s+/g, " ").trim();
-      if (combined) {
-        transcriptAccumulatorRef.current = combined;
-        alternativesAccumulatorRef.current = altList;
-        setLiveTranscript(combined);
-        // Reset the 3-second silence timer every time new speech is heard
-        resetPostSpeechSilenceTimer();
-      }
-    };
-
-    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      clearAllTimers();
-      errorOccurredRef.current = event.error;
-
-      if (
-        event.error === "not-allowed" ||
-        event.error === "service-not-allowed"
-      ) {
-        hasProcessedRef.current = true;
+      } catch (err) {
+        console.warn("Non-critical getUserMedia warning:", err);
         setMicPermissionDenied(true);
         setShowManualInput(true);
         setMicState("ready");
         return;
       }
-
-      if (event.error === "aborted") {
-        hasProcessedRef.current = true;
-        setMicState("ready");
-        return;
-      }
-    };
-
-    recognition.onend = () => {
-      clearAllTimers();
-      if (hasProcessedRef.current) return;
-      hasProcessedRef.current = true;
-
-      const finalSpoken = transcriptAccumulatorRef.current.trim();
-      const alts = alternativesAccumulatorRef.current;
-
-      if (!finalSpoken) {
-        processSpokenAttemptRef.current("", [], "no_speech");
-      } else {
-        setLiveTranscript(finalSpoken);
-        processSpokenAttemptRef.current(finalSpoken, alts);
-      }
-    };
-
-    try {
-      setMicState("listening");
-      recognition.start();
-    } catch {
-      setMicState("ready");
     }
-  }, [clearAllTimers, isPlayingAudio, micState, stopListening]);
+
+    // Allow up to 12 seconds after permission is granted before initial timeout if no speech starts
+    initialWaitTimerRef.current = window.setTimeout(() => {
+      if (
+        !transcriptAccumulatorRef.current.trim() &&
+        !hadVoiceActivityRef.current
+      ) {
+        finalizeRecordingRef.current();
+      }
+    }, 12000);
+
+    // 2. Start Browser Web Speech API for real-time text streaming
+    const SpeechRec =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRec) {
+      try {
+        const recognition = new SpeechRec();
+        recognition.lang = "en-US";
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.maxAlternatives = 3;
+        recognitionRef.current = recognition;
+
+        recognition.onresult = (event: SpeechRecognitionEvent) => {
+          if (isStoppingRef.current) return;
+          let interim = "";
+          let finalStr = "";
+          const altList: string[] = [];
+
+          for (let i = 0; i < event.results.length; i++) {
+            const res = event.results[i];
+            const primaryTranscript = res[0]?.transcript || "";
+            if (res.isFinal) {
+              finalStr += primaryTranscript + " ";
+            } else {
+              interim += primaryTranscript + " ";
+            }
+            for (let a = 0; a < res.length; a++) {
+              if (res[a]?.transcript) {
+                altList.push(res[a].transcript);
+              }
+            }
+          }
+
+          const combined = (finalStr + interim).replace(/\s+/g, " ").trim();
+          if (combined) {
+            transcriptAccumulatorRef.current = combined;
+            alternativesAccumulatorRef.current = altList;
+            setLiveTranscript(combined);
+            resetPostSpeechSilenceTimer();
+          }
+        };
+
+        recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+          if (
+            event.error === "not-allowed" ||
+            event.error === "service-not-allowed"
+          ) {
+            // Only abort if we don't have an active PCM AudioContext stream
+            if (!mediaStreamRef.current) {
+              setMicPermissionDenied(true);
+              setShowManualInput(true);
+              finalizeRecordingRef.current();
+            }
+          }
+        };
+
+        recognition.onend = () => {
+          // If SpeechRecognition already captured final words and user paused, or if no PCM stream is active, finalize
+          if (
+            !isStoppingRef.current &&
+            (transcriptAccumulatorRef.current.trim().length > 0 ||
+              !mediaStreamRef.current)
+          ) {
+            finalizeRecordingRef.current();
+          }
+        };
+
+        recognition.start();
+      } catch (err) {
+        console.warn("Non-critical SpeechRecognition start skipped:", err);
+      }
+    }
+  }, [cleanupAudioPipeline, clearAllTimers, isPlayingAudio, micState]);
 
   const handleSelectFood = (foodId: FoodId) => {
     setSelectedFood(foodId);
@@ -647,7 +701,6 @@ export default function App() {
 
   const handleSelectReason = (reasonId: ReasonId) => {
     if (currentStep !== 2 && selectedReason === reasonId) {
-      // Toggle off optional reason tag in non-reason steps
       setSelectedReason(null);
     } else {
       setSelectedReason(reasonId);
@@ -660,6 +713,8 @@ export default function App() {
     setLiveTranscript("");
     transcriptAccumulatorRef.current = "";
     alternativesAccumulatorRef.current = [];
+    pcmChunksRef.current = [];
+    hadVoiceActivityRef.current = false;
     setCurrentFeedback(null);
     setMicState("ready");
   };
@@ -805,7 +860,8 @@ export default function App() {
               </button>
 
               <p className="text-center text-xs text-slate-500">
-                Your voice is processed to turn it into text and is not recorded or saved.
+                Your voice is processed to turn it into text and is not recorded
+                or saved.
               </p>
             </div>
           </section>
@@ -962,6 +1018,13 @@ export default function App() {
                   type="button"
                   disabled={isPlayingAudio || micState === "processing"}
                   onClick={handleMicToggle}
+                  style={
+                    micState === "listening"
+                      ? {
+                          transform: `scale(${1 + micLevel * 0.14})`,
+                        }
+                      : undefined
+                  }
                   aria-label={
                     micState === "listening"
                       ? "Listening - Tap to stop"
@@ -969,9 +1032,9 @@ export default function App() {
                       ? "Processing speech"
                       : "Tap to Speak"
                   }
-                  className={`w-24 h-24 rounded-full flex flex-col items-center justify-center gap-1 text-white font-display font-bold shadow-md transition-all cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
+                  className={`w-24 h-24 rounded-full flex flex-col items-center justify-center gap-1 text-white font-display font-bold shadow-md transition-transform duration-75 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
                     micState === "listening"
-                      ? "bg-emerald-600 hover:bg-emerald-700 ring-8 ring-emerald-500/20 scale-105"
+                      ? "bg-emerald-600 hover:bg-emerald-700 ring-8 ring-emerald-500/25"
                       : micState === "processing"
                       ? "bg-blue-600 ring-8 ring-blue-500/20"
                       : "bg-slate-500 hover:bg-slate-600 active:scale-95"
@@ -986,7 +1049,9 @@ export default function App() {
                     <>
                       <Mic className="w-8 h-8" />
                       <span className="text-xs">
-                        {micState === "listening" ? "Listening" : "Tap to Speak"}
+                        {micState === "listening"
+                          ? "Listening"
+                          : "Tap to Speak"}
                       </span>
                     </>
                   )}
@@ -1000,19 +1065,23 @@ export default function App() {
                     </p>
                   ) : micState === "listening" ? (
                     <p className="text-xs font-medium text-emerald-700">
-                      Speak now... (auto-stops after 3s of silence)
+                      Listening... Tap button when done or pause for 3s
                     </p>
                   ) : null}
                 </div>
 
-                {/* Optional Keyboard Fallback toggle if user wants to type or test */}
+                {/* Optional Keyboard Fallback toggle */}
                 <button
                   type="button"
                   onClick={() => setShowManualInput((prev) => !prev)}
                   className="mt-1 text-[11px] text-slate-400 hover:text-slate-600 flex items-center gap-1 cursor-pointer"
                 >
                   <Keyboard className="w-3 h-3" />
-                  <span>{showManualInput ? "Hide keyboard input" : "Type or test response"}</span>
+                  <span>
+                    {showManualInput
+                      ? "Hide keyboard input"
+                      : "Type or test response"}
+                  </span>
                 </button>
               </div>
 
@@ -1084,7 +1153,9 @@ export default function App() {
 
                 <button
                   type="button"
-                  disabled={!hasCreatedTargetSentence || micState === "listening"}
+                  disabled={
+                    !hasCreatedTargetSentence || micState === "listening"
+                  }
                   onClick={handleNextPhase}
                   className="flex-1 min-h-[46px] px-5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:bg-slate-200 disabled:text-slate-400 text-white font-semibold text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer whitespace-nowrap shrink-0"
                 >
@@ -1135,8 +1206,10 @@ export default function App() {
             <div className="divide-y divide-slate-100 border-t border-b border-slate-200">
               {DIALOGUE_STEPS.map((stepItem) => {
                 const rec = turnRecords.find((r) => r.step === stepItem.step);
-                const targetSent = rec?.targetSentence || stepItem.canonicalSentence;
-                const spokenSent = rec?.spokenText || stepItem.canonicalSentence;
+                const targetSent =
+                  rec?.targetSentence || stepItem.canonicalSentence;
+                const spokenSent =
+                  rec?.spokenText || stepItem.canonicalSentence;
 
                 return (
                   <div
