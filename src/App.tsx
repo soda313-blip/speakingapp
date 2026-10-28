@@ -30,7 +30,6 @@ import {
 import {
   generateFeedbackClientSide,
   getFallbackFeedback,
-  transcribeAudioBlobClientSide,
 } from "./services/geminiClient";
 
 type ScreenMode = "start" | "practice" | "result";
@@ -96,6 +95,7 @@ interface SpeechRecognitionInstance extends EventTarget {
   start: () => void;
   stop: () => void;
   abort: () => void;
+  onstart: (() => void) | null;
   onresult: ((event: SpeechRecognitionEvent) => void) | null;
   onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
   onend: (() => void) | null;
@@ -143,21 +143,20 @@ export default function App() {
   const [showManualInput, setShowManualInput] = useState<boolean>(false);
   const [manualTextInput, setManualTextInput] = useState<string>("");
 
-  // Refs for Web Audio API, MediaRecorder, SpeechRecognition, and RAF loop
+  // Refs for SpeechRecognition auto-restart loop & AnalyserNode visualizer
+  const isRecordingRef = useRef<boolean>(false);
+  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
   const rafIdRef = useRef<number | null>(null);
-  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
 
-  const silenceTimerRef = useRef<number | null>(null);
-  const initialWaitTimerRef = useRef<number | null>(null);
-  const transcriptAccumulatorRef = useRef<string>("");
+  // Transcript accumulators across auto-restarts
+  const committedFinalRef = useRef<string>("");
+  const currentSessionFinalRef = useRef<string>("");
+  const currentSessionInterimRef = useRef<string>("");
   const alternativesAccumulatorRef = useRef<string[]>([]);
-  const hadVoiceActivityRef = useRef<boolean>(false);
-  const isFinalizingRef = useRef<boolean>(false);
+  const postSpeechSilenceTimerRef = useRef<number | null>(null);
 
   const partner = PARTNER_PROFILES[partnerIndex] || PARTNER_PROFILES[0];
   const stepConfig = DIALOGUE_STEPS[currentStep - 1] || DIALOGUE_STEPS[0];
@@ -181,10 +180,7 @@ export default function App() {
 
       const SpeechRec =
         window.SpeechRecognition || window.webkitSpeechRecognition;
-      const hasMediaDevices = !!(
-        navigator.mediaDevices && navigator.mediaDevices.getUserMedia
-      );
-      if (!SpeechRec && !hasMediaDevices) {
+      if (!SpeechRec) {
         setSpeechSupported(false);
       }
 
@@ -194,19 +190,17 @@ export default function App() {
     }
   }, []);
 
-  const clearAllTimers = useCallback(() => {
-    if (typeof window === "undefined") return;
-    if (silenceTimerRef.current) {
-      window.clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    if (initialWaitTimerRef.current) {
-      window.clearTimeout(initialWaitTimerRef.current);
-      initialWaitTimerRef.current = null;
+  const clearPostSpeechTimer = useCallback(() => {
+    if (typeof window !== "undefined" && postSpeechSilenceTimerRef.current) {
+      window.clearTimeout(postSpeechSilenceTimerRef.current);
+      postSpeechSilenceTimerRef.current = null;
     }
   }, []);
 
-  const cleanupAudioResources = useCallback(() => {
+  const stopVisualizerAndRecognition = useCallback(() => {
+    isRecordingRef.current = false;
+    clearPostSpeechTimer();
+
     if (typeof window !== "undefined" && rafIdRef.current !== null) {
       window.cancelAnimationFrame(rafIdRef.current);
       rafIdRef.current = null;
@@ -225,21 +219,9 @@ export default function App() {
       recognitionRef.current = null;
     }
 
-    if (
-      mediaRecorderRef.current &&
-      mediaRecorderRef.current.state !== "inactive"
-    ) {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch {
-        // ignore
-      }
-    }
-    mediaRecorderRef.current = null;
-
     if (mediaStreamRef.current) {
       try {
-        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       } catch {
         // ignore
       }
@@ -255,12 +237,11 @@ export default function App() {
       audioCtxRef.current = null;
     }
     analyserRef.current = null;
-  }, []);
+  }, [clearPostSpeechTimer]);
 
   const initializeStepDefaults = useCallback(
     (stepNum: number) => {
-      clearAllTimers();
-      cleanupAudioResources();
+      stopVisualizerAndRecognition();
       const cfg = DIALOGUE_STEPS[stepNum - 1];
       if (!cfg) return;
       setSelectedFood(cfg.recommendedFood);
@@ -268,17 +249,16 @@ export default function App() {
       setHasChosenFood(true);
       setHasCreatedTargetSentence(false);
       setLiveTranscript("");
-      transcriptAccumulatorRef.current = "";
+      committedFinalRef.current = "";
+      currentSessionFinalRef.current = "";
+      currentSessionInterimRef.current = "";
       alternativesAccumulatorRef.current = [];
-      recordedChunksRef.current = [];
-      hadVoiceActivityRef.current = false;
-      isFinalizingRef.current = false;
       setCurrentFeedback(null);
       setConsecutiveFailures(0);
       setMatchedKeywords([]);
       setMicState("ready");
     },
-    [cleanupAudioResources, clearAllTimers]
+    [stopVisualizerAndRecognition]
   );
 
   const speakText = useCallback(
@@ -318,10 +298,9 @@ export default function App() {
       } catch {
         // ignore
       }
-      clearAllTimers();
-      cleanupAudioResources();
+      stopVisualizerAndRecognition();
     };
-  }, [cleanupAudioResources, clearAllTimers]);
+  }, [stopVisualizerAndRecognition]);
 
   const processSpokenAttempt = useCallback(
     async (
@@ -440,109 +419,55 @@ export default function App() {
     ]
   );
 
-  const finalizeCaptureAndTranscribe = useCallback(async () => {
-    if (isFinalizingRef.current) return;
-    isFinalizingRef.current = true;
+  const stopAndEvaluate = useCallback(async () => {
+    isRecordingRef.current = false;
+    stopVisualizerAndRecognition();
 
-    clearAllTimers();
-    if (typeof window !== "undefined" && rafIdRef.current !== null) {
-      window.cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = null;
-    }
-    setVolumeLevel(0);
-    setMicState("transcribing");
+    const fullText = [
+      committedFinalRef.current,
+      currentSessionFinalRef.current,
+      currentSessionInterimRef.current,
+    ]
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
 
-    // Stop SpeechRecognition if active
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.onend = null;
-        recognitionRef.current.onerror = null;
-        recognitionRef.current.stop();
-      } catch {
-        // ignore
-      }
-      recognitionRef.current = null;
-    }
-
-    // Stop MediaRecorder and wait briefly for final dataavailable chunk
-    const recorder = mediaRecorderRef.current;
-    if (recorder && recorder.state !== "inactive") {
-      await new Promise<void>((resolve) => {
-        const timeout = window.setTimeout(() => resolve(), 400);
-        recorder.onstop = () => {
-          window.clearTimeout(timeout);
-          resolve();
-        };
-        try {
-          recorder.stop();
-        } catch {
-          window.clearTimeout(timeout);
-          resolve();
-        }
-      });
-    }
-
-    const chunks = [...recordedChunksRef.current];
-    const mimeType = recorder?.mimeType || "audio/webm";
-    const audioBlob =
-      chunks.length > 0 ? new Blob(chunks, { type: mimeType }) : null;
-    const hadVoice = hadVoiceActivityRef.current;
-
-    cleanupAudioResources();
-
-    let finalSpoken = transcriptAccumulatorRef.current.trim();
     const alts = alternativesAccumulatorRef.current;
 
-    // If Web Speech API didn't emit a transcript, transcribe the MediaRecorder audio Blob client-side via Gemini
-    if (!finalSpoken && audioBlob && audioBlob.size > 200) {
-      try {
-        const transcribed = await transcribeAudioBlobClientSide(
-          audioBlob,
-          dynamicTarget.sentence
-        );
-        if (transcribed) {
-          finalSpoken = transcribed;
-          setLiveTranscript(finalSpoken);
-        }
-      } catch (err) {
-        console.warn("Non-critical fetch skipped:", err);
-      }
-    }
-
-    // If the user clearly spoke into the mic (AnalyserNode registered sustained voice activity and chunks were emitted)
-    // but both browser SpeechRecognition and Gemini transcription were blocked/offline in the sandbox:
-    if (!finalSpoken && hadVoice && audioBlob && audioBlob.size > 1500) {
-      finalSpoken = dynamicTarget.sentence;
-      setLiveTranscript(finalSpoken);
-    }
-
-    if (!finalSpoken) {
+    if (!fullText) {
       await processSpokenAttempt("", [], "no_speech");
     } else {
-      setLiveTranscript(finalSpoken);
-      await processSpokenAttempt(finalSpoken, alts);
+      setLiveTranscript(fullText);
+      await processSpokenAttempt(fullText, alts);
     }
-  }, [
-    cleanupAudioResources,
-    clearAllTimers,
-    dynamicTarget.sentence,
-    processSpokenAttempt,
-  ]);
+  }, [processSpokenAttempt, stopVisualizerAndRecognition]);
 
-  const finalizeCaptureRef = useRef(finalizeCaptureAndTranscribe);
+  const stopAndEvaluateRef = useRef(stopAndEvaluate);
   useEffect(() => {
-    finalizeCaptureRef.current = finalizeCaptureAndTranscribe;
-  }, [finalizeCaptureAndTranscribe]);
+    stopAndEvaluateRef.current = stopAndEvaluate;
+  }, [stopAndEvaluate]);
 
   const handleMicToggle = useCallback(async () => {
     if (isPlayingAudio) return;
 
-    if (micState === "listening") {
-      await finalizeCaptureRef.current();
+    // If currently listening, pressing the mic button stops recording and evaluates
+    if (isRecordingRef.current || micState === "listening") {
+      await stopAndEvaluateRef.current();
       return;
     }
 
     if (micState === "transcribing") return;
+
+    const SpeechRec =
+      typeof window !== "undefined"
+        ? window.SpeechRecognition || window.webkitSpeechRecognition
+        : undefined;
+
+    if (!SpeechRec) {
+      setSpeechSupported(false);
+      setShowManualInput(true);
+      return;
+    }
 
     try {
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
@@ -553,212 +478,192 @@ export default function App() {
       // ignore
     }
 
-    clearAllTimers();
-    cleanupAudioResources();
+    stopVisualizerAndRecognition();
 
     setLiveTranscript("");
-    transcriptAccumulatorRef.current = "";
+    committedFinalRef.current = "";
+    currentSessionFinalRef.current = "";
+    currentSessionInterimRef.current = "";
     alternativesAccumulatorRef.current = [];
-    recordedChunksRef.current = [];
-    hadVoiceActivityRef.current = false;
-    isFinalizingRef.current = false;
     setCurrentFeedback(null);
     setMicPermissionDenied(false);
 
-    const resetSilenceCountdown = () => {
-      if (typeof window === "undefined") return;
-      if (initialWaitTimerRef.current) {
-        window.clearTimeout(initialWaitTimerRef.current);
-        initialWaitTimerRef.current = null;
-      }
-      if (silenceTimerRef.current) {
-        window.clearTimeout(silenceTimerRef.current);
-      }
-      silenceTimerRef.current = window.setTimeout(() => {
-        finalizeCaptureRef.current();
-      }, 3000);
-    };
-
-    // Step 1: Acquire microphone stream with echoCancellation and noiseSuppression
-    let stream: MediaStream;
+    // Requirement 4: Capture getUserMedia({ audio: true }) strictly for AnalyserNode visualizer
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
-      });
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: true,
+        });
+        const tracks = stream.getAudioTracks();
+        if (tracks[0]) {
+          tracks[0].enabled = true;
+        }
+        mediaStreamRef.current = stream;
+
+        const AudioContextClass =
+          window.AudioContext || window.webkitAudioContext;
+        if (AudioContextClass) {
+          const audioContext = new AudioContextClass();
+          audioCtxRef.current = audioContext;
+          if (audioContext.state === "suspended") {
+            await audioContext.resume();
+          }
+
+          const source = audioContext.createMediaStreamSource(stream);
+          const analyser = audioContext.createAnalyser();
+          analyser.fftSize = 256;
+          analyser.smoothingTimeConstant = 0.75;
+          source.connect(analyser);
+          analyserRef.current = analyser;
+
+          const dataArray = new Uint8Array(analyser.frequencyBinCount);
+          const updateVisualizer = () => {
+            if (!isRecordingRef.current || !analyserRef.current) return;
+            analyserRef.current.getByteFrequencyData(dataArray);
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) {
+              sum += dataArray[i];
+            }
+            const avg = sum / dataArray.length;
+            const normalized = Math.min(100, Math.round((avg / 100) * 100));
+            setVolumeLevel(normalized);
+            rafIdRef.current = window.requestAnimationFrame(updateVisualizer);
+          };
+          rafIdRef.current = window.requestAnimationFrame(updateVisualizer);
+        }
+      }
     } catch (err) {
-      console.warn("[Audio] Microphone permission or stream error:", err);
+      console.warn("[Audio] Visualizer getUserMedia warning:", err);
       setMicPermissionDenied(true);
       setShowManualInput(true);
       setMicState("error");
       return;
     }
 
-    // Step 4: Ensure the audio tracks are active
-    const audioTracks = stream.getAudioTracks();
-    if (audioTracks[0]) {
-      audioTracks[0].enabled = true;
-    }
-    console.log(
-      "[Audio] Stream acquired:",
-      stream.id,
-      audioTracks.map((t) => ({
-        label: t.label,
-        enabled: t.enabled,
-        readyState: t.readyState,
-      }))
-    );
-    mediaStreamRef.current = stream;
+    // Requirement 1, 2, 3: Configure SpeechRecognition with auto-restart loop on onend
+    isRecordingRef.current = true;
     setMicState("listening");
 
-    // Step 2: Create AudioContext after user click & explicitly resume if suspended
-    try {
-      const AudioContextClass =
-        window.AudioContext || window.webkitAudioContext;
-      if (AudioContextClass) {
-        const audioContext = new AudioContextClass();
-        audioCtxRef.current = audioContext;
-        if (audioContext.state === "suspended") {
-          await audioContext.resume();
+    const recognition = new SpeechRec();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+    recognition.maxAlternatives = 3;
+    recognitionRef.current = recognition;
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      if (!isRecordingRef.current) return;
+
+      let sessionFinal = "";
+      let sessionInterim = "";
+      const altList: string[] = [];
+
+      for (let i = 0; i < event.results.length; i++) {
+        const result = event.results[i];
+        const transcriptPiece = result[0]?.transcript || "";
+        if (result.isFinal) {
+          sessionFinal += transcriptPiece + " ";
+        } else {
+          sessionInterim += transcriptPiece + " ";
         }
-        console.log("[Audio] AudioContext state:", audioContext.state);
-
-        // Step 3: Attach AnalyserNode and update visible UI volume meter every requestAnimationFrame
-        const source = audioContext.createMediaStreamSource(stream);
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.75;
-        source.connect(analyser);
-        analyserRef.current = analyser;
-
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        const updateMeter = () => {
-          if (!analyserRef.current || isFinalizingRef.current) return;
-          analyserRef.current.getByteFrequencyData(dataArray);
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            sum += dataArray[i];
+        for (let a = 0; a < result.length; a++) {
+          if (result[a]?.transcript) {
+            altList.push(result[a].transcript);
           }
-          const avg = sum / dataArray.length;
-          const normalized = Math.min(100, Math.round((avg / 110) * 100));
-          setVolumeLevel(normalized);
-
-          // Voice activity threshold
-          if (avg > 14) {
-            hadVoiceActivityRef.current = true;
-            resetSilenceCountdown();
-          }
-
-          rafIdRef.current = window.requestAnimationFrame(updateMeter);
-        };
-        rafIdRef.current = window.requestAnimationFrame(updateMeter);
+        }
       }
-    } catch (err) {
-      console.warn("[Audio] AudioContext/Analyser setup warning:", err);
-    }
 
-    // Step 5 & 6: Start MediaRecorder capture loop and log data chunks emitted
-    try {
-      if (typeof MediaRecorder !== "undefined") {
-        const preferredMime = MediaRecorder.isTypeSupported(
-          "audio/webm;codecs=opus"
-        )
-          ? "audio/webm;codecs=opus"
-          : MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : "";
-
-        const recorder = preferredMime
-          ? new MediaRecorder(stream, { mimeType: preferredMime })
-          : new MediaRecorder(stream);
-
-        recorder.ondataavailable = (event: BlobEvent) => {
-          if (event.data && event.data.size > 0) {
-            recordedChunksRef.current.push(event.data);
-            console.log(
-              "[Audio] Data chunk emitted:",
-              event.data.size,
-              "bytes",
-              event.data.type
-            );
-          }
-        };
-
-        recorder.start(250);
-        mediaRecorderRef.current = recorder;
+      currentSessionFinalRef.current = sessionFinal.trim();
+      currentSessionInterimRef.current = sessionInterim.trim();
+      if (altList.length > 0) {
+        alternativesAccumulatorRef.current = [
+          ...alternativesAccumulatorRef.current,
+          ...altList,
+        ];
       }
-    } catch (err) {
-      console.warn("[Audio] MediaRecorder start warning:", err);
-    }
 
-    // Also run Web Speech API in parallel for instant live word preview when supported
-    try {
-      const SpeechRec =
-        window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (SpeechRec) {
-        const recognition = new SpeechRec();
-        recognition.lang = "en-US";
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.maxAlternatives = 3;
-        recognitionRef.current = recognition;
+      const fullTranscript = [
+        committedFinalRef.current,
+        currentSessionFinalRef.current,
+        currentSessionInterimRef.current,
+      ]
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
 
-        recognition.onresult = (event: SpeechRecognitionEvent) => {
-          if (isFinalizingRef.current) return;
-          let interim = "";
-          let finalStr = "";
-          const altList: string[] = [];
+      if (fullTranscript) {
+        setLiveTranscript(fullTranscript);
 
-          for (let i = 0; i < event.results.length; i++) {
-            const res = event.results[i];
-            const primaryTranscript = res[0]?.transcript || "";
-            if (res.isFinal) {
-              finalStr += primaryTranscript + " ";
-            } else {
-              interim += primaryTranscript + " ";
-            }
-            for (let a = 0; a < res.length; a++) {
-              if (res[a]?.transcript) {
-                altList.push(res[a].transcript);
-              }
-            }
+        // Automatically stop after 3 seconds of silence once spoken words have been captured
+        clearPostSpeechTimer();
+        postSpeechSilenceTimerRef.current = window.setTimeout(() => {
+          if (isRecordingRef.current) {
+            stopAndEvaluateRef.current();
           }
-
-          const combined = (finalStr + interim).replace(/\s+/g, " ").trim();
-          if (combined) {
-            transcriptAccumulatorRef.current = combined;
-            alternativesAccumulatorRef.current = altList;
-            setLiveTranscript(combined);
-            hadVoiceActivityRef.current = true;
-            resetSilenceCountdown();
-          }
-        };
-
-        recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-          console.warn(
-            "[Audio] SpeechRecognition non-fatal notice:",
-            event.error
-          );
-        };
-
-        recognition.start();
+        }, 3000);
       }
-    } catch (err) {
-      console.warn("[Audio] SpeechRecognition optional start skipped:", err);
-    }
+    };
 
-    // Initial 12-second timeout if user never speaks after opening the mic
-    initialWaitTimerRef.current = window.setTimeout(() => {
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      if (event.error === "no-speech") {
+        console.log("[SpeechRecognition] no-speech (continuing session)");
+        return;
+      }
+      if (event.error === "aborted") {
+        return;
+      }
       if (
-        !hadVoiceActivityRef.current &&
-        !transcriptAccumulatorRef.current.trim()
+        event.error === "not-allowed" ||
+        event.error === "service-not-allowed"
       ) {
-        finalizeCaptureRef.current();
+        isRecordingRef.current = false;
+        stopVisualizerAndRecognition();
+        setMicPermissionDenied(true);
+        setShowManualInput(true);
+        setMicState("error");
+        return;
       }
-    }, 12000);
-  }, [cleanupAudioResources, clearAllTimers, isPlayingAudio, micState]);
+      console.warn("[SpeechRecognition] error:", event.error);
+    };
+
+    recognition.onend = () => {
+      // Preserve any finalized text from this session before restarting
+      if (
+        currentSessionFinalRef.current ||
+        currentSessionInterimRef.current
+      ) {
+        committedFinalRef.current = [
+          committedFinalRef.current,
+          currentSessionFinalRef.current || currentSessionInterimRef.current,
+        ]
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+        currentSessionFinalRef.current = "";
+        currentSessionInterimRef.current = "";
+      }
+
+      // Requirement 1: Auto-restart loop if recording is still active
+      if (isRecordingRef.current) {
+        try {
+          recognition.start();
+        } catch (err) {
+          console.warn("[SpeechRecognition] Auto-restart warning:", err);
+        }
+      }
+    };
+
+    try {
+      recognition.start();
+    } catch (err) {
+      console.warn("[SpeechRecognition] Initial start error:", err);
+    }
+  }, [
+    clearPostSpeechTimer,
+    isPlayingAudio,
+    micState,
+    stopVisualizerAndRecognition,
+  ]);
 
   const handleSelectFood = (foodId: FoodId) => {
     setSelectedFood(foodId);
@@ -782,17 +687,19 @@ export default function App() {
   };
 
   const handleTryAgain = () => {
+    stopVisualizerAndRecognition();
     setLiveTranscript("");
-    transcriptAccumulatorRef.current = "";
+    committedFinalRef.current = "";
+    currentSessionFinalRef.current = "";
+    currentSessionInterimRef.current = "";
     alternativesAccumulatorRef.current = [];
-    recordedChunksRef.current = [];
-    hadVoiceActivityRef.current = false;
     setCurrentFeedback(null);
     setMicState("ready");
   };
 
   const handleNextPhase = () => {
     if (!hasCreatedTargetSentence) return;
+    stopVisualizerAndRecognition();
 
     if (!turnRecords.some((r) => r.step === currentStep)) {
       const partnerQ = stepConfig.partnerLine(currentFoodObj);
@@ -1083,7 +990,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* BOTTOM: Large Round Mic Button + Live Volume Meter + Spoken Text + Feedback Card */}
+            {/* BOTTOM: Large Round Mic Button + Live Volume Visualizer + Real-Time Spoken Text + Feedback Card */}
             <div className="pt-2 border-t border-slate-100 space-y-4">
               <div className="flex flex-col items-center">
                 <button
@@ -1099,7 +1006,7 @@ export default function App() {
                   }
                   aria-label={
                     micState === "listening"
-                      ? "Listening - Tap to stop"
+                      ? "Listening - Tap to finish speaking"
                       : micState === "transcribing"
                       ? "Transcribing speech"
                       : "Tap to Speak"
@@ -1124,7 +1031,7 @@ export default function App() {
                       <Mic className="w-8 h-8" />
                       <span className="text-xs">
                         {micState === "listening"
-                          ? "Listening..."
+                          ? "Tap Done"
                           : micState === "error"
                           ? "Error"
                           : "Tap to Speak"}
@@ -1133,7 +1040,7 @@ export default function App() {
                   )}
                 </button>
 
-                {/* On-Screen State Indicator & Live Green Volume Bar */}
+                {/* On-Screen State Indicator & Reactive Green Volume Bar */}
                 <div className="mt-3 w-full max-w-xs flex flex-col items-center gap-1.5">
                   <span
                     className={`text-xs font-semibold ${
@@ -1147,9 +1054,9 @@ export default function App() {
                     }`}
                   >
                     {micState === "listening"
-                      ? "Listening... (Tap mic when done or pause 3s)"
+                      ? "Listening... Speak clearly, then tap mic or pause 3s"
                       : micState === "transcribing"
-                      ? "Transcribing..."
+                      ? "Checking your sentence..."
                       : micState === "error"
                       ? "Error accessing microphone"
                       : "Ready"}
@@ -1162,24 +1069,26 @@ export default function App() {
                     >
                       <div
                         className="h-full bg-emerald-500 transition-all duration-75"
-                        style={{ width: `${Math.max(6, volumeLevel)}%` }}
+                        style={{ width: `${Math.max(8, volumeLevel)}%` }}
                       />
                     </div>
                   )}
                 </div>
 
                 {/* Real-Time Spoken Text Display */}
-                {liveTranscript && (
-                  <p className="mt-2 text-base font-semibold text-slate-900 text-center">
-                    &ldquo;{liveTranscript}&rdquo;
-                  </p>
-                )}
+                <div className="mt-2 min-h-[28px] text-center">
+                  {liveTranscript ? (
+                    <p className="text-base font-semibold text-slate-900">
+                      &ldquo;{liveTranscript}&rdquo;
+                    </p>
+                  ) : null}
+                </div>
 
                 {/* Optional Keyboard Fallback toggle */}
                 <button
                   type="button"
                   onClick={() => setShowManualInput((prev) => !prev)}
-                  className="mt-2 text-[11px] text-slate-400 hover:text-slate-600 flex items-center gap-1 cursor-pointer"
+                  className="mt-1 text-[11px] text-slate-400 hover:text-slate-600 flex items-center gap-1 cursor-pointer"
                 >
                   <Keyboard className="w-3 h-3" />
                   <span>
