@@ -1,0 +1,6 @@
+{
+  "name": "Whats For Dinner? - Dinner Choices",
+  "description": "An interactive CEFR A2 English speaking practice app where middle school students negotiate and decide on a dinner menu with friends.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
