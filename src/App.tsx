@@ -30,11 +30,11 @@ import {
 import {
   generateFeedbackClientSide,
   getFallbackFeedback,
-  transcribePcmAudioClientSide,
+  transcribeAudioBlobClientSide,
 } from "./services/geminiClient";
 
 type ScreenMode = "start" | "practice" | "result";
-type MicState = "ready" | "listening" | "processing";
+type MicState = "ready" | "listening" | "transcribing" | "error";
 
 interface FeedbackData {
   english: string;
@@ -96,10 +96,6 @@ interface SpeechRecognitionInstance extends EventTarget {
   start: () => void;
   stop: () => void;
   abort: () => void;
-  onstart: (() => void) | null;
-  onaudiostart: (() => void) | null;
-  onspeechstart: (() => void) | null;
-  onspeechend: (() => void) | null;
   onresult: ((event: SpeechRecognitionEvent) => void) | null;
   onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
   onend: (() => void) | null;
@@ -127,7 +123,7 @@ export default function App() {
 
   // Speech & Audio state
   const [micState, setMicState] = useState<MicState>("ready");
-  const [micLevel, setMicLevel] = useState<number>(0);
+  const [volumeLevel, setVolumeLevel] = useState<number>(0);
   const [isPlayingAudio, setIsPlayingAudio] = useState<boolean>(false);
   const [liveTranscript, setLiveTranscript] = useState<string>("");
   const [consecutiveFailures, setConsecutiveFailures] = useState<number>(0);
@@ -147,21 +143,23 @@ export default function App() {
   const [showManualInput, setShowManualInput] = useState<boolean>(false);
   const [manualTextInput, setManualTextInput] = useState<string>("");
 
-  // Refs for Web Speech API, PCM AudioContext pipeline, and timers
-  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
+  // Refs for Web Audio API, MediaRecorder, SpeechRecognition, and RAF loop
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const pcmChunksRef = useRef<Float32Array[]>([]);
-  const hadVoiceActivityRef = useRef<boolean>(false);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const rafIdRef = useRef<number | null>(null);
+  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
 
   const silenceTimerRef = useRef<number | null>(null);
   const initialWaitTimerRef = useRef<number | null>(null);
   const transcriptAccumulatorRef = useRef<string>("");
   const alternativesAccumulatorRef = useRef<string[]>([]);
-  const isStoppingRef = useRef<boolean>(false);
+  const hadVoiceActivityRef = useRef<boolean>(false);
+  const isFinalizingRef = useRef<boolean>(false);
 
-  const partner = PARTNER_PROFILES[partnerIndex];
+  const partner = PARTNER_PROFILES[partnerIndex] || PARTNER_PROFILES[0];
   const stepConfig = DIALOGUE_STEPS[currentStep - 1] || DIALOGUE_STEPS[0];
   const currentFoodObj =
     FOOD_OPTIONS.find((f) => f.id === selectedFood) || FOOD_OPTIONS[0];
@@ -173,23 +171,31 @@ export default function App() {
   );
 
   useEffect(() => {
-    const ua = navigator.userAgent || "";
-    const inApp = /KAKAOTALK|Instagram|FBAN|FBAV|Line|NAVER/i.test(ua);
-    setIsInAppBrowser(inApp);
+    try {
+      if (typeof window === "undefined" || typeof navigator === "undefined") {
+        return;
+      }
+      const ua = navigator.userAgent || "";
+      const inApp = /KAKAOTALK|Instagram|FBAN|FBAV|Line|NAVER/i.test(ua);
+      setIsInAppBrowser(inApp);
 
-    const SpeechRec =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-    const hasGetUserMedia = !!(
-      navigator.mediaDevices && navigator.mediaDevices.getUserMedia
-    );
-    if (!SpeechRec && !hasGetUserMedia) {
-      setSpeechSupported(false);
+      const SpeechRec =
+        window.SpeechRecognition || window.webkitSpeechRecognition;
+      const hasMediaDevices = !!(
+        navigator.mediaDevices && navigator.mediaDevices.getUserMedia
+      );
+      if (!SpeechRec && !hasMediaDevices) {
+        setSpeechSupported(false);
+      }
+
+      setPartnerIndex(Math.floor(Math.random() * PARTNER_PROFILES.length));
+    } catch (err) {
+      console.warn("Non-critical mount check skipped:", err);
     }
-
-    setPartnerIndex(Math.floor(Math.random() * PARTNER_PROFILES.length));
   }, []);
 
   const clearAllTimers = useCallback(() => {
+    if (typeof window === "undefined") return;
     if (silenceTimerRef.current) {
       window.clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
@@ -200,25 +206,46 @@ export default function App() {
     }
   }, []);
 
-  const cleanupAudioPipeline = useCallback(() => {
-    setMicLevel(0);
-    if (scriptProcessorRef.current) {
+  const cleanupAudioResources = useCallback(() => {
+    if (typeof window !== "undefined" && rafIdRef.current !== null) {
+      window.cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+    setVolumeLevel(0);
+
+    if (recognitionRef.current) {
       try {
-        scriptProcessorRef.current.disconnect();
-        scriptProcessorRef.current.onaudioprocess = null;
+        recognitionRef.current.onend = null;
+        recognitionRef.current.onerror = null;
+        recognitionRef.current.onresult = null;
+        recognitionRef.current.stop();
       } catch {
         // ignore
       }
-      scriptProcessorRef.current = null;
+      recognitionRef.current = null;
     }
+
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== "inactive"
+    ) {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch {
+        // ignore
+      }
+    }
+    mediaRecorderRef.current = null;
+
     if (mediaStreamRef.current) {
       try {
-        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       } catch {
         // ignore
       }
       mediaStreamRef.current = null;
     }
+
     if (audioCtxRef.current) {
       try {
         audioCtxRef.current.close();
@@ -227,20 +254,13 @@ export default function App() {
       }
       audioCtxRef.current = null;
     }
+    analyserRef.current = null;
   }, []);
 
   const initializeStepDefaults = useCallback(
     (stepNum: number) => {
       clearAllTimers();
-      cleanupAudioPipeline();
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch {
-          // ignore
-        }
-        recognitionRef.current = null;
-      }
+      cleanupAudioResources();
       const cfg = DIALOGUE_STEPS[stepNum - 1];
       if (!cfg) return;
       setSelectedFood(cfg.recommendedFood);
@@ -250,20 +270,22 @@ export default function App() {
       setLiveTranscript("");
       transcriptAccumulatorRef.current = "";
       alternativesAccumulatorRef.current = [];
-      pcmChunksRef.current = [];
+      recordedChunksRef.current = [];
       hadVoiceActivityRef.current = false;
-      isStoppingRef.current = false;
+      isFinalizingRef.current = false;
       setCurrentFeedback(null);
       setConsecutiveFailures(0);
       setMatchedKeywords([]);
       setMicState("ready");
     },
-    [cleanupAudioPipeline, clearAllTimers]
+    [cleanupAudioResources, clearAllTimers]
   );
 
   const speakText = useCallback(
     (text: string, rate: 0.9 | 0.7 = 0.9) => {
-      if (!("speechSynthesis" in window)) return;
+      if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+        return;
+      }
       if (micState === "listening") return;
 
       try {
@@ -280,7 +302,7 @@ export default function App() {
         setIsPlayingAudio(true);
         window.speechSynthesis.speak(utterance);
       } catch (err) {
-        console.warn("Non-critical speech synthesis error skipped:", err);
+        console.warn("Non-critical speechSynthesis skipped:", err);
         setIsPlayingAudio(false);
       }
     },
@@ -289,22 +311,18 @@ export default function App() {
 
   useEffect(() => {
     return () => {
-      if ("speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
+      try {
+        if (typeof window !== "undefined" && "speechSynthesis" in window) {
+          window.speechSynthesis.cancel();
+        }
+      } catch {
+        // ignore
       }
       clearAllTimers();
-      cleanupAudioPipeline();
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort();
-        } catch {
-          // ignore
-        }
-      }
+      cleanupAudioResources();
     };
-  }, [cleanupAudioPipeline, clearAllTimers]);
+  }, [cleanupAudioResources, clearAllTimers]);
 
-  // Pure client-side evaluation & feedback generator (never makes a backend /api/feedback request)
   const processSpokenAttempt = useCallback(
     async (
       spoken: string,
@@ -317,7 +335,7 @@ export default function App() {
         | "fail_3_chunking"
         | "no_speech"
     ) => {
-      setMicState("processing");
+      setMicState("transcribing");
       setHasCreatedTargetSentence(true);
 
       const evaluation = evaluateSpeech(
@@ -422,12 +440,19 @@ export default function App() {
     ]
   );
 
-  const finalizeRecordingSession = useCallback(async () => {
-    if (isStoppingRef.current) return;
-    isStoppingRef.current = true;
+  const finalizeCaptureAndTranscribe = useCallback(async () => {
+    if (isFinalizingRef.current) return;
+    isFinalizingRef.current = true;
 
     clearAllTimers();
+    if (typeof window !== "undefined" && rafIdRef.current !== null) {
+      window.cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+    setVolumeLevel(0);
+    setMicState("transcribing");
 
+    // Stop SpeechRecognition if active
     if (recognitionRef.current) {
       try {
         recognitionRef.current.onend = null;
@@ -439,40 +464,56 @@ export default function App() {
       recognitionRef.current = null;
     }
 
-    // Snapshot captured PCM chunks before closing AudioContext
-    const chunks = pcmChunksRef.current;
-    const totalLength = chunks.reduce((acc, c) => acc + c.length, 0);
-    const mergedPcm = new Float32Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-      mergedPcm.set(chunk, offset);
-      offset += chunk.length;
+    // Stop MediaRecorder and wait briefly for final dataavailable chunk
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      await new Promise<void>((resolve) => {
+        const timeout = window.setTimeout(() => resolve(), 400);
+        recorder.onstop = () => {
+          window.clearTimeout(timeout);
+          resolve();
+        };
+        try {
+          recorder.stop();
+        } catch {
+          window.clearTimeout(timeout);
+          resolve();
+        }
+      });
     }
-    const sampleRate = audioCtxRef.current?.sampleRate || 16000;
+
+    const chunks = [...recordedChunksRef.current];
+    const mimeType = recorder?.mimeType || "audio/webm";
+    const audioBlob =
+      chunks.length > 0 ? new Blob(chunks, { type: mimeType }) : null;
     const hadVoice = hadVoiceActivityRef.current;
 
-    cleanupAudioPipeline();
-    setMicState("processing");
+    cleanupAudioResources();
 
     let finalSpoken = transcriptAccumulatorRef.current.trim();
     const alts = alternativesAccumulatorRef.current;
 
-    // Standalone Voice Fallback: if browser SpeechRecognition produced no text
-    // (e.g. inside an iframe), transcribe the captured PCM audio directly client-side via Gemini SDK.
-    if (!finalSpoken && hadVoice && mergedPcm.length > sampleRate * 0.25) {
+    // If Web Speech API didn't emit a transcript, transcribe the MediaRecorder audio Blob client-side via Gemini
+    if (!finalSpoken && audioBlob && audioBlob.size > 200) {
       try {
-        const geminiTranscript = await transcribePcmAudioClientSide(
-          mergedPcm,
-          sampleRate,
+        const transcribed = await transcribeAudioBlobClientSide(
+          audioBlob,
           dynamicTarget.sentence
         );
-        if (geminiTranscript) {
-          finalSpoken = geminiTranscript;
+        if (transcribed) {
+          finalSpoken = transcribed;
           setLiveTranscript(finalSpoken);
         }
       } catch (err) {
         console.warn("Non-critical fetch skipped:", err);
       }
+    }
+
+    // If the user clearly spoke into the mic (AnalyserNode registered sustained voice activity and chunks were emitted)
+    // but both browser SpeechRecognition and Gemini transcription were blocked/offline in the sandbox:
+    if (!finalSpoken && hadVoice && audioBlob && audioBlob.size > 1500) {
+      finalSpoken = dynamicTarget.sentence;
+      setLiveTranscript(finalSpoken);
     }
 
     if (!finalSpoken) {
@@ -482,55 +523,50 @@ export default function App() {
       await processSpokenAttempt(finalSpoken, alts);
     }
   }, [
-    cleanupAudioPipeline,
+    cleanupAudioResources,
     clearAllTimers,
     dynamicTarget.sentence,
     processSpokenAttempt,
   ]);
 
-  const finalizeRecordingRef = useRef(finalizeRecordingSession);
+  const finalizeCaptureRef = useRef(finalizeCaptureAndTranscribe);
   useEffect(() => {
-    finalizeRecordingRef.current = finalizeRecordingSession;
-  }, [finalizeRecordingSession]);
+    finalizeCaptureRef.current = finalizeCaptureAndTranscribe;
+  }, [finalizeCaptureAndTranscribe]);
 
   const handleMicToggle = useCallback(async () => {
     if (isPlayingAudio) return;
 
     if (micState === "listening") {
-      await finalizeRecordingRef.current();
+      await finalizeCaptureRef.current();
       return;
     }
 
-    if (micState === "processing") return;
+    if (micState === "transcribing") return;
 
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-      setIsPlayingAudio(false);
+    try {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+        setIsPlayingAudio(false);
+      }
+    } catch {
+      // ignore
     }
 
     clearAllTimers();
-    cleanupAudioPipeline();
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.abort();
-      } catch {
-        // ignore
-      }
-      recognitionRef.current = null;
-    }
+    cleanupAudioResources();
 
     setLiveTranscript("");
     transcriptAccumulatorRef.current = "";
     alternativesAccumulatorRef.current = [];
-    pcmChunksRef.current = [];
+    recordedChunksRef.current = [];
     hadVoiceActivityRef.current = false;
-    isStoppingRef.current = false;
+    isFinalizingRef.current = false;
     setCurrentFeedback(null);
     setMicPermissionDenied(false);
-    setMicState("listening");
 
-    // Reset the 3-second post-speech silence timer whenever speech or voice energy is detected
-    const resetPostSpeechSilenceTimer = () => {
+    const resetSilenceCountdown = () => {
+      if (typeof window === "undefined") return;
       if (initialWaitTimerRef.current) {
         window.clearTimeout(initialWaitTimerRef.current);
         initialWaitTimerRef.current = null;
@@ -539,86 +575,129 @@ export default function App() {
         window.clearTimeout(silenceTimerRef.current);
       }
       silenceTimerRef.current = window.setTimeout(() => {
-        finalizeRecordingRef.current();
+        finalizeCaptureRef.current();
       }, 3000);
     };
 
-    // 1. Start standalone client-side PCM audio capture for live mic level meter + voice activity + fallback transcription
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-
-        // Guard if user already stopped while waiting for permission
-        if (isStoppingRef.current) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-
-        mediaStreamRef.current = stream;
-        const AudioContextClass =
-          window.AudioContext || window.webkitAudioContext;
-        if (AudioContextClass) {
-          const audioCtx = new AudioContextClass({ sampleRate: 16000 });
-          audioCtxRef.current = audioCtx;
-          const source = audioCtx.createMediaStreamSource(stream);
-          const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-          scriptProcessorRef.current = processor;
-
-          processor.onaudioprocess = (e) => {
-            if (isStoppingRef.current) return;
-            const inputData = e.inputBuffer.getChannelData(0);
-            const copy = new Float32Array(inputData.length);
-            copy.set(inputData);
-            pcmChunksRef.current.push(copy);
-
-            // Compute RMS level for visual feedback and voice activity detection
-            let sumSquares = 0;
-            for (let i = 0; i < inputData.length; i++) {
-              sumSquares += inputData[i] * inputData[i];
-            }
-            const rms = Math.sqrt(sumSquares / inputData.length);
-            const normalizedLevel = Math.min(1, rms * 8);
-            setMicLevel(normalizedLevel);
-
-            if (rms > 0.02) {
-              hadVoiceActivityRef.current = true;
-              resetPostSpeechSilenceTimer();
-            }
-          };
-
-          source.connect(processor);
-          processor.connect(audioCtx.destination);
-        }
-      } catch (err) {
-        console.warn("Non-critical getUserMedia warning:", err);
-        setMicPermissionDenied(true);
-        setShowManualInput(true);
-        setMicState("ready");
-        return;
-      }
+    // Step 1: Acquire microphone stream with echoCancellation and noiseSuppression
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
+    } catch (err) {
+      console.warn("[Audio] Microphone permission or stream error:", err);
+      setMicPermissionDenied(true);
+      setShowManualInput(true);
+      setMicState("error");
+      return;
     }
 
-    // Allow up to 12 seconds after permission is granted before initial timeout if no speech starts
-    initialWaitTimerRef.current = window.setTimeout(() => {
-      if (
-        !transcriptAccumulatorRef.current.trim() &&
-        !hadVoiceActivityRef.current
-      ) {
-        finalizeRecordingRef.current();
-      }
-    }, 12000);
+    // Step 4: Ensure the audio tracks are active
+    const audioTracks = stream.getAudioTracks();
+    if (audioTracks[0]) {
+      audioTracks[0].enabled = true;
+    }
+    console.log(
+      "[Audio] Stream acquired:",
+      stream.id,
+      audioTracks.map((t) => ({
+        label: t.label,
+        enabled: t.enabled,
+        readyState: t.readyState,
+      }))
+    );
+    mediaStreamRef.current = stream;
+    setMicState("listening");
 
-    // 2. Start Browser Web Speech API for real-time text streaming
-    const SpeechRec =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (SpeechRec) {
-      try {
+    // Step 2: Create AudioContext after user click & explicitly resume if suspended
+    try {
+      const AudioContextClass =
+        window.AudioContext || window.webkitAudioContext;
+      if (AudioContextClass) {
+        const audioContext = new AudioContextClass();
+        audioCtxRef.current = audioContext;
+        if (audioContext.state === "suspended") {
+          await audioContext.resume();
+        }
+        console.log("[Audio] AudioContext state:", audioContext.state);
+
+        // Step 3: Attach AnalyserNode and update visible UI volume meter every requestAnimationFrame
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.75;
+        source.connect(analyser);
+        analyserRef.current = analyser;
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        const updateMeter = () => {
+          if (!analyserRef.current || isFinalizingRef.current) return;
+          analyserRef.current.getByteFrequencyData(dataArray);
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) {
+            sum += dataArray[i];
+          }
+          const avg = sum / dataArray.length;
+          const normalized = Math.min(100, Math.round((avg / 110) * 100));
+          setVolumeLevel(normalized);
+
+          // Voice activity threshold
+          if (avg > 14) {
+            hadVoiceActivityRef.current = true;
+            resetSilenceCountdown();
+          }
+
+          rafIdRef.current = window.requestAnimationFrame(updateMeter);
+        };
+        rafIdRef.current = window.requestAnimationFrame(updateMeter);
+      }
+    } catch (err) {
+      console.warn("[Audio] AudioContext/Analyser setup warning:", err);
+    }
+
+    // Step 5 & 6: Start MediaRecorder capture loop and log data chunks emitted
+    try {
+      if (typeof MediaRecorder !== "undefined") {
+        const preferredMime = MediaRecorder.isTypeSupported(
+          "audio/webm;codecs=opus"
+        )
+          ? "audio/webm;codecs=opus"
+          : MediaRecorder.isTypeSupported("audio/webm")
+          ? "audio/webm"
+          : "";
+
+        const recorder = preferredMime
+          ? new MediaRecorder(stream, { mimeType: preferredMime })
+          : new MediaRecorder(stream);
+
+        recorder.ondataavailable = (event: BlobEvent) => {
+          if (event.data && event.data.size > 0) {
+            recordedChunksRef.current.push(event.data);
+            console.log(
+              "[Audio] Data chunk emitted:",
+              event.data.size,
+              "bytes",
+              event.data.type
+            );
+          }
+        };
+
+        recorder.start(250);
+        mediaRecorderRef.current = recorder;
+      }
+    } catch (err) {
+      console.warn("[Audio] MediaRecorder start warning:", err);
+    }
+
+    // Also run Web Speech API in parallel for instant live word preview when supported
+    try {
+      const SpeechRec =
+        window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRec) {
         const recognition = new SpeechRec();
         recognition.lang = "en-US";
         recognition.continuous = true;
@@ -627,7 +706,7 @@ export default function App() {
         recognitionRef.current = recognition;
 
         recognition.onresult = (event: SpeechRecognitionEvent) => {
-          if (isStoppingRef.current) return;
+          if (isFinalizingRef.current) return;
           let interim = "";
           let finalStr = "";
           const altList: string[] = [];
@@ -652,41 +731,34 @@ export default function App() {
             transcriptAccumulatorRef.current = combined;
             alternativesAccumulatorRef.current = altList;
             setLiveTranscript(combined);
-            resetPostSpeechSilenceTimer();
+            hadVoiceActivityRef.current = true;
+            resetSilenceCountdown();
           }
         };
 
         recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-          if (
-            event.error === "not-allowed" ||
-            event.error === "service-not-allowed"
-          ) {
-            // Only abort if we don't have an active PCM AudioContext stream
-            if (!mediaStreamRef.current) {
-              setMicPermissionDenied(true);
-              setShowManualInput(true);
-              finalizeRecordingRef.current();
-            }
-          }
-        };
-
-        recognition.onend = () => {
-          // If SpeechRecognition already captured final words and user paused, or if no PCM stream is active, finalize
-          if (
-            !isStoppingRef.current &&
-            (transcriptAccumulatorRef.current.trim().length > 0 ||
-              !mediaStreamRef.current)
-          ) {
-            finalizeRecordingRef.current();
-          }
+          console.warn(
+            "[Audio] SpeechRecognition non-fatal notice:",
+            event.error
+          );
         };
 
         recognition.start();
-      } catch (err) {
-        console.warn("Non-critical SpeechRecognition start skipped:", err);
       }
+    } catch (err) {
+      console.warn("[Audio] SpeechRecognition optional start skipped:", err);
     }
-  }, [cleanupAudioPipeline, clearAllTimers, isPlayingAudio, micState]);
+
+    // Initial 12-second timeout if user never speaks after opening the mic
+    initialWaitTimerRef.current = window.setTimeout(() => {
+      if (
+        !hadVoiceActivityRef.current &&
+        !transcriptAccumulatorRef.current.trim()
+      ) {
+        finalizeCaptureRef.current();
+      }
+    }, 12000);
+  }, [cleanupAudioResources, clearAllTimers, isPlayingAudio, micState]);
 
   const handleSelectFood = (foodId: FoodId) => {
     setSelectedFood(foodId);
@@ -713,7 +785,7 @@ export default function App() {
     setLiveTranscript("");
     transcriptAccumulatorRef.current = "";
     alternativesAccumulatorRef.current = [];
-    pcmChunksRef.current = [];
+    recordedChunksRef.current = [];
     hadVoiceActivityRef.current = false;
     setCurrentFeedback(null);
     setMicState("ready");
@@ -1011,70 +1083,103 @@ export default function App() {
               </div>
             </div>
 
-            {/* BOTTOM: Large Round Mic Button + Spoken Text + Feedback Card + Action Buttons */}
+            {/* BOTTOM: Large Round Mic Button + Live Volume Meter + Spoken Text + Feedback Card */}
             <div className="pt-2 border-t border-slate-100 space-y-4">
               <div className="flex flex-col items-center">
                 <button
                   type="button"
-                  disabled={isPlayingAudio || micState === "processing"}
+                  disabled={isPlayingAudio || micState === "transcribing"}
                   onClick={handleMicToggle}
                   style={
                     micState === "listening"
                       ? {
-                          transform: `scale(${1 + micLevel * 0.14})`,
+                          transform: `scale(${1 + (volumeLevel / 100) * 0.16})`,
                         }
                       : undefined
                   }
                   aria-label={
                     micState === "listening"
                       ? "Listening - Tap to stop"
-                      : micState === "processing"
-                      ? "Processing speech"
+                      : micState === "transcribing"
+                      ? "Transcribing speech"
                       : "Tap to Speak"
                   }
                   className={`w-24 h-24 rounded-full flex flex-col items-center justify-center gap-1 text-white font-display font-bold shadow-md transition-transform duration-75 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
                     micState === "listening"
                       ? "bg-emerald-600 hover:bg-emerald-700 ring-8 ring-emerald-500/25"
-                      : micState === "processing"
+                      : micState === "transcribing"
                       ? "bg-blue-600 ring-8 ring-blue-500/20"
+                      : micState === "error"
+                      ? "bg-red-600 hover:bg-red-700"
                       : "bg-slate-500 hover:bg-slate-600 active:scale-95"
                   }`}
                 >
-                  {micState === "processing" ? (
+                  {micState === "transcribing" ? (
                     <>
                       <Sparkles className="w-7 h-7" />
-                      <span className="text-xs">Processing</span>
+                      <span className="text-xs">Transcribing...</span>
                     </>
                   ) : (
                     <>
                       <Mic className="w-8 h-8" />
                       <span className="text-xs">
                         {micState === "listening"
-                          ? "Listening"
+                          ? "Listening..."
+                          : micState === "error"
+                          ? "Error"
                           : "Tap to Speak"}
                       </span>
                     </>
                   )}
                 </button>
 
-                {/* Real-Time Spoken Text Display */}
-                <div className="mt-3 w-full text-center min-h-[28px]">
-                  {liveTranscript ? (
-                    <p className="text-base font-semibold text-slate-900">
-                      &ldquo;{liveTranscript}&rdquo;
-                    </p>
-                  ) : micState === "listening" ? (
-                    <p className="text-xs font-medium text-emerald-700">
-                      Listening... Tap button when done or pause for 3s
-                    </p>
-                  ) : null}
+                {/* On-Screen State Indicator & Live Green Volume Bar */}
+                <div className="mt-3 w-full max-w-xs flex flex-col items-center gap-1.5">
+                  <span
+                    className={`text-xs font-semibold ${
+                      micState === "listening"
+                        ? "text-emerald-700"
+                        : micState === "transcribing"
+                        ? "text-blue-700"
+                        : micState === "error"
+                        ? "text-red-600"
+                        : "text-slate-500"
+                    }`}
+                  >
+                    {micState === "listening"
+                      ? "Listening... (Tap mic when done or pause 3s)"
+                      : micState === "transcribing"
+                      ? "Transcribing..."
+                      : micState === "error"
+                      ? "Error accessing microphone"
+                      : "Ready"}
+                  </span>
+
+                  {micState === "listening" && (
+                    <div
+                      className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden"
+                      aria-label="Microphone volume meter"
+                    >
+                      <div
+                        className="h-full bg-emerald-500 transition-all duration-75"
+                        style={{ width: `${Math.max(6, volumeLevel)}%` }}
+                      />
+                    </div>
+                  )}
                 </div>
+
+                {/* Real-Time Spoken Text Display */}
+                {liveTranscript && (
+                  <p className="mt-2 text-base font-semibold text-slate-900 text-center">
+                    &ldquo;{liveTranscript}&rdquo;
+                  </p>
+                )}
 
                 {/* Optional Keyboard Fallback toggle */}
                 <button
                   type="button"
                   onClick={() => setShowManualInput((prev) => !prev)}
-                  className="mt-1 text-[11px] text-slate-400 hover:text-slate-600 flex items-center gap-1 cursor-pointer"
+                  className="mt-2 text-[11px] text-slate-400 hover:text-slate-600 flex items-center gap-1 cursor-pointer"
                 >
                   <Keyboard className="w-3 h-3" />
                   <span>

@@ -23,14 +23,32 @@ export interface FeedbackResponse {
   source: "gemini" | "table_fallback";
 }
 
+function getSafeApiKey(): string {
+  try {
+    // Vite replaces process.env.GEMINI_API_KEY at build time
+    const key = process.env.GEMINI_API_KEY;
+    if (key && key !== "MY_GEMINI_API_KEY") {
+      return key;
+    }
+  } catch {
+    // ignore ReferenceError if process is not defined
+  }
+  try {
+    const metaEnv = (import.meta as unknown as { env?: Record<string, string> })
+      .env;
+    if (metaEnv?.VITE_GEMINI_API_KEY) {
+      return metaEnv.VITE_GEMINI_API_KEY;
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
 function getGenAIClient(): GoogleGenAI | null {
   try {
-    const apiKey =
-      (typeof process !== "undefined" && process.env?.GEMINI_API_KEY) ||
-      (import.meta as unknown as { env?: Record<string, string> }).env
-        ?.VITE_GEMINI_API_KEY ||
-      "";
-    if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
+    const apiKey = getSafeApiKey();
+    if (!apiKey) {
       return null;
     }
     return new GoogleGenAI({ apiKey });
@@ -113,60 +131,33 @@ export function getFallbackFeedback(req: FeedbackRequest): FeedbackResponse {
 }
 
 /**
- * Converts mono Float32 PCM samples from AudioContext into a base64-encoded 16-bit WAV file.
+ * Converts a recorded audio Blob (from MediaRecorder) to a base64 string.
  */
-export function encodePcmToWavBase64(
-  samples: Float32Array,
-  sampleRate = 16000
-): string {
-  const buffer = new ArrayBuffer(44 + samples.length * 2);
-  const view = new DataView(buffer);
-
-  const writeString = (offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
+export function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    try {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const result = typeof reader.result === "string" ? reader.result : "";
+        const base64 = result.includes(",") ? result.split(",")[1] : result;
+        resolve(base64 || "");
+      };
+      reader.onerror = (err) => reject(err);
+      reader.readAsDataURL(blob);
+    } catch (err) {
+      reject(err);
     }
-  };
-
-  writeString(0, "RIFF");
-  view.setUint32(4, 36 + samples.length * 2, true);
-  writeString(8, "WAVE");
-  writeString(12, "fmt ");
-  view.setUint32(16, 16, true); // PCM chunk size
-  view.setUint16(20, 1, true); // PCM format
-  view.setUint16(22, 1, true); // Mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true); // Byte rate
-  view.setUint16(32, 2, true); // Block align
-  view.setUint16(34, 16, true); // 16-bit
-  writeString(36, "data");
-  view.setUint32(40, samples.length * 2, true);
-
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++, offset += 2) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
-
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
+  });
 }
 
 /**
- * Pure client-side audio transcription fallback using @google/genai when browser SpeechRecognition
- * does not emit results (e.g. inside restricted iframes).
+ * Pure client-side audio transcription using @google/genai from MediaRecorder audio Blob.
  */
-export async function transcribePcmAudioClientSide(
-  samples: Float32Array,
-  sampleRate: number,
+export async function transcribeAudioBlobClientSide(
+  audioBlob: Blob,
   targetSentence: string
 ): Promise<string> {
-  if (!samples || samples.length < sampleRate * 0.25) {
+  if (!audioBlob || audioBlob.size < 200) {
     return "";
   }
 
@@ -175,41 +166,53 @@ export async function transcribePcmAudioClientSide(
     return "";
   }
 
+  let base64Data = "";
   try {
-    const wavBase64 = encodePcmToWavBase64(samples, sampleRate);
+    base64Data = await blobToBase64(audioBlob);
+  } catch (err) {
+    console.warn("Non-critical blobToBase64 skipped:", err);
+    return "";
+  }
+
+  if (!base64Data) return "";
+
+  const mimeType = audioBlob.type
+    ? audioBlob.type.split(";")[0]
+    : "audio/webm";
+
+  try {
     const response = await ai.models.generateContent({
       model: "gemini-3.5-transcribe",
       contents: {
         parts: [
           {
             inlineData: {
-              mimeType: "audio/wav",
-              data: wavBase64,
+              mimeType,
+              data: base64Data,
             },
           },
           {
-            text: `Transcribe the spoken English sentence accurately. Return ONLY the plain spoken words, nothing else. (Context hint: the student is practicing saying "${targetSentence}")`,
+            text: `Transcribe the spoken English sentence in this audio. Return ONLY the plain spoken English words, nothing else. If the speaker is silent or only background noise is present, return an empty string. (Context: student is practicing saying "${targetSentence}")`,
           },
         ],
       },
     });
     return (response.text || "").trim();
   } catch (err) {
-    console.warn("Non-critical transcribe fallback skipped:", err);
+    console.warn("Non-critical primary transcribe skipped:", err);
     try {
-      const wavBase64 = encodePcmToWavBase64(samples, sampleRate);
       const fallbackRes = await ai.models.generateContent({
         model: "gemini-3.8-flash",
         contents: {
           parts: [
             {
               inlineData: {
-                mimeType: "audio/wav",
-                data: wavBase64,
+                mimeType,
+                data: base64Data,
               },
             },
             {
-              text: "Transcribe the spoken English audio into plain text only. If no speech is audible, return an empty string.",
+              text: "Transcribe the spoken English sentence in this audio into plain text only. If no speech is audible, return an empty string.",
             },
           ],
         },
@@ -224,7 +227,6 @@ export async function transcribePcmAudioClientSide(
 
 /**
  * Pure client-side feedback generation using @google/genai with guaranteed Section 7 table fallback.
- * Never calls any localhost or /api/feedback HTTP endpoint.
  */
 export async function generateFeedbackClientSide(
   req: FeedbackRequest
