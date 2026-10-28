@@ -7,17 +7,23 @@ import {
   ArrowRight,
   Star,
   AlertTriangle,
-  Sparkles,
   Play,
   Keyboard,
+  CheckCircle2,
+  Edit3,
 } from "lucide-react";
 import {
   FOOD_OPTIONS,
   REASON_OPTIONS,
+  PLACE_OPTIONS,
+  CLOSING_OPTIONS,
   DIALOGUE_STEPS,
   PARTNER_PROFILES,
   FoodId,
   ReasonId,
+  PlaceId,
+  ClosingId,
+  ConversationContext,
   buildDynamicTarget,
   evaluateSpeech,
 } from "./data/dialogueData";
@@ -33,7 +39,7 @@ import {
 } from "./services/geminiClient";
 
 type ScreenMode = "start" | "practice" | "result";
-type MicState = "ready" | "listening" | "transcribing" | "error";
+type MicState = "ready" | "listening" | "error";
 
 interface FeedbackData {
   english: string;
@@ -113,13 +119,19 @@ export default function App() {
   const [screen, setScreen] = useState<ScreenMode>("start");
   const [partnerIndex, setPartnerIndex] = useState<number>(0);
 
-  // Practice turn state (Steps 1..5)
+  // Coherent 5-turn conversation state following PRD Section 6
   const [currentStep, setCurrentStep] = useState<number>(1);
-  const [selectedFood, setSelectedFood] = useState<FoodId>("pizza");
+  const [initialFoodId, setInitialFoodId] = useState<FoodId>("pizza");
+  const [negotiatedFoodId, setNegotiatedFoodId] =
+    useState<FoodId>("tteokbokki");
+
+  // Per-turn student selections
+  const [selectedFood, setSelectedFood] = useState<FoodId | null>(null);
   const [selectedReason, setSelectedReason] = useState<ReasonId | null>(null);
-  const [hasChosenFood, setHasChosenFood] = useState<boolean>(true);
-  const [hasCreatedTargetSentence, setHasCreatedTargetSentence] =
-    useState<boolean>(false);
+  const [selectedPlace, setSelectedPlace] = useState<PlaceId | null>(null);
+  const [selectedClosing, setSelectedClosing] = useState<ClosingId | null>(
+    null
+  );
 
   // Speech & Audio state
   const [micState, setMicState] = useState<MicState>("ready");
@@ -130,7 +142,11 @@ export default function App() {
   const [currentFeedback, setCurrentFeedback] = useState<FeedbackData | null>(
     null
   );
+  const [evaluationPassed, setEvaluationPassed] = useState<boolean | null>(
+    null
+  );
   const [matchedKeywords, setMatchedKeywords] = useState<string[]>([]);
+  const [missingKeywords, setMissingKeywords] = useState<string[]>([]);
 
   // Completed turn records for Screen 3 Result Screen
   const [turnRecords, setTurnRecords] = useState<TurnRecord[]>([]);
@@ -150,23 +166,56 @@ export default function App() {
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const rafIdRef = useRef<number | null>(null);
+  const feedbackCardRef = useRef<HTMLDivElement | null>(null);
 
   // Transcript accumulators across auto-restarts
   const committedFinalRef = useRef<string>("");
   const currentSessionFinalRef = useRef<string>("");
   const currentSessionInterimRef = useRef<string>("");
+  const latestTranscriptRef = useRef<string>("");
   const alternativesAccumulatorRef = useRef<string[]>([]);
   const postSpeechSilenceTimerRef = useRef<number | null>(null);
 
   const partner = PARTNER_PROFILES[partnerIndex] || PARTNER_PROFILES[0];
   const stepConfig = DIALOGUE_STEPS[currentStep - 1] || DIALOGUE_STEPS[0];
-  const currentFoodObj =
-    FOOD_OPTIONS.find((f) => f.id === selectedFood) || FOOD_OPTIONS[0];
+
+  const conversationCtx: ConversationContext = {
+    initialFoodId,
+    negotiatedFoodId,
+  };
+
+  // Active food for current step:
+  // Step 1: selectedFood (or initialFoodId)
+  // Step 2: locked to initialFoodId (the food chosen in Step 1!)
+  // Step 3: selectedFood (the alternative food chosen in Step 3)
+  // Step 4 & 5: locked to negotiatedFoodId (the agreed food from Step 3!)
+  const activeFoodId: FoodId =
+    currentStep === 1
+      ? selectedFood || initialFoodId
+      : currentStep === 2
+      ? initialFoodId
+      : currentStep === 3
+      ? selectedFood || negotiatedFoodId
+      : negotiatedFoodId;
+
+  // Check if current step's required choice is completed
+  const isSentenceComplete =
+    currentStep === 1
+      ? selectedFood !== null
+      : currentStep === 2
+      ? selectedReason !== null
+      : currentStep === 3
+      ? selectedFood !== null
+      : currentStep === 4
+      ? selectedPlace !== null
+      : selectedClosing !== null;
 
   const dynamicTarget = buildDynamicTarget(
     currentStep,
-    selectedFood,
-    selectedReason
+    activeFoodId,
+    selectedReason,
+    selectedPlace,
+    selectedClosing
   );
 
   useEffect(() => {
@@ -240,22 +289,23 @@ export default function App() {
   }, [clearPostSpeechTimer]);
 
   const initializeStepDefaults = useCallback(
-    (stepNum: number) => {
+    (_stepNum: number) => {
       stopVisualizerAndRecognition();
-      const cfg = DIALOGUE_STEPS[stepNum - 1];
-      if (!cfg) return;
-      setSelectedFood(cfg.recommendedFood);
-      setSelectedReason(stepNum === 2 ? cfg.recommendedReason : null);
-      setHasChosenFood(true);
-      setHasCreatedTargetSentence(false);
+      setSelectedFood(null);
+      setSelectedReason(null);
+      setSelectedPlace(null);
+      setSelectedClosing(null);
       setLiveTranscript("");
       committedFinalRef.current = "";
       currentSessionFinalRef.current = "";
       currentSessionInterimRef.current = "";
+      latestTranscriptRef.current = "";
       alternativesAccumulatorRef.current = [];
       setCurrentFeedback(null);
+      setEvaluationPassed(null);
       setConsecutiveFailures(0);
       setMatchedKeywords([]);
+      setMissingKeywords([]);
       setMicState("ready");
     },
     [stopVisualizerAndRecognition]
@@ -302,8 +352,22 @@ export default function App() {
     };
   }, [stopVisualizerAndRecognition]);
 
+  // Scroll feedback card into view whenever new feedback arrives
+  useEffect(() => {
+    if (currentFeedback && feedbackCardRef.current) {
+      try {
+        feedbackCardRef.current.scrollIntoView({
+          behavior: "smooth",
+          block: "nearest",
+        });
+      } catch {
+        // ignore
+      }
+    }
+  }, [currentFeedback]);
+
   const processSpokenAttempt = useCallback(
-    async (
+    (
       spoken: string,
       alternatives: string[] = [],
       forcedSituation?:
@@ -314,9 +378,6 @@ export default function App() {
         | "fail_3_chunking"
         | "no_speech"
     ) => {
-      setMicState("transcribing");
-      setHasCreatedTargetSentence(true);
-
       const evaluation = evaluateSpeech(
         spoken,
         dynamicTarget,
@@ -324,6 +385,12 @@ export default function App() {
         alternatives
       );
       const situation = forcedSituation || evaluation.situation;
+      const passed =
+        situation === "success" ||
+        situation === "partial" ||
+        evaluation.passed;
+
+      setEvaluationPassed(passed);
 
       const isFailure =
         situation === "fail_1_recast" ||
@@ -332,7 +399,7 @@ export default function App() {
 
       if (isFailure) {
         setConsecutiveFailures((prev) => prev + 1);
-      } else if (situation === "success" || situation === "partial") {
+      } else if (passed) {
         setConsecutiveFailures(0);
       }
 
@@ -359,8 +426,9 @@ export default function App() {
           : [dynamicTarget.keywords[0] || "because"];
 
       setMatchedKeywords(computedMatched);
+      setMissingKeywords(computedMissing);
 
-      const partnerQ = stepConfig.partnerLine(currentFoodObj);
+      const partnerQ = stepConfig.partnerLine(conversationCtx);
       const feedbackReq = {
         situation,
         targetSentence: dynamicTarget.sentence,
@@ -370,25 +438,16 @@ export default function App() {
         partnerQuestion: partnerQ,
       };
 
-      let fb: FeedbackData;
-      try {
-        const res = await generateFeedbackClientSide(feedbackReq);
-        fb = {
-          ...res,
-          situation,
-        };
-      } catch (err) {
-        console.warn("Non-critical fetch skipped:", err);
-        const fallback = getFallbackFeedback(feedbackReq);
-        fb = {
-          ...fallback,
-          situation,
-        };
-      }
+      // Immediately display the PRD Section 7 feedback synchronously so the UI NEVER gets stuck on transcribing
+      const immediatePrdFeedback: FeedbackData = {
+        ...getFallbackFeedback(feedbackReq),
+        situation,
+      };
 
-      setCurrentFeedback(fb);
+      setCurrentFeedback(immediatePrdFeedback);
+      setMicState("ready");
 
-      const record: TurnRecord = {
+      const initialRecord: TurnRecord = {
         step: currentStep,
         partnerQuestion: partnerQ,
         targetSentence: dynamicTarget.sentence,
@@ -396,34 +455,49 @@ export default function App() {
         spokenText: spoken.trim() || "(No speech detected)",
         matchedKeywords: computedMatched,
         missingKeywords: computedMissing,
-        feedback: fb,
-        foodId: selectedFood,
+        feedback: immediatePrdFeedback,
+        foodId: activeFoodId,
         reasonId: selectedReason,
       };
 
       setTurnRecords((prev) => {
         const filtered = prev.filter((r) => r.step !== currentStep);
-        return [...filtered, record].sort((a, b) => a.step - b.step);
+        return [...filtered, initialRecord].sort((a, b) => a.step - b.step);
       });
 
-      setMicState("ready");
+      // Optionally enhance via server-side Gemini in the background without blocking the UI
+      if (situation !== "no_speech") {
+        generateFeedbackClientSide(feedbackReq)
+          .then((res) => {
+            if (res && res.source === "gemini") {
+              const updatedFb: FeedbackData = {
+                ...res,
+                situation,
+              };
+              setCurrentFeedback(updatedFb);
+            }
+          })
+          .catch(() => {
+            // Keep immediate PRD Section 7 feedback
+          });
+      }
     },
     [
+      activeFoodId,
       consecutiveFailures,
-      currentFoodObj,
+      conversationCtx,
       currentStep,
       dynamicTarget,
-      selectedFood,
       selectedReason,
       stepConfig,
     ]
   );
 
-  const stopAndEvaluate = useCallback(async () => {
+  const stopAndEvaluate = useCallback(() => {
     isRecordingRef.current = false;
     stopVisualizerAndRecognition();
 
-    const fullText = [
+    const combinedFromRefs = [
       committedFinalRef.current,
       currentSessionFinalRef.current,
       currentSessionInterimRef.current,
@@ -432,13 +506,14 @@ export default function App() {
       .replace(/\s+/g, " ")
       .trim();
 
+    const fullText = combinedFromRefs || latestTranscriptRef.current.trim();
     const alts = alternativesAccumulatorRef.current;
 
     if (!fullText) {
-      await processSpokenAttempt("", [], "no_speech");
+      processSpokenAttempt("", [], "no_speech");
     } else {
       setLiveTranscript(fullText);
-      await processSpokenAttempt(fullText, alts);
+      processSpokenAttempt(fullText, alts);
     }
   }, [processSpokenAttempt, stopVisualizerAndRecognition]);
 
@@ -448,15 +523,12 @@ export default function App() {
   }, [stopAndEvaluate]);
 
   const handleMicToggle = useCallback(async () => {
-    if (isPlayingAudio) return;
+    if (!isSentenceComplete || isPlayingAudio) return;
 
-    // If currently listening, pressing the mic button stops recording and evaluates
     if (isRecordingRef.current || micState === "listening") {
-      await stopAndEvaluateRef.current();
+      stopAndEvaluateRef.current();
       return;
     }
-
-    if (micState === "transcribing") return;
 
     const SpeechRec =
       typeof window !== "undefined"
@@ -484,11 +556,13 @@ export default function App() {
     committedFinalRef.current = "";
     currentSessionFinalRef.current = "";
     currentSessionInterimRef.current = "";
+    latestTranscriptRef.current = "";
     alternativesAccumulatorRef.current = [];
     setCurrentFeedback(null);
+    setEvaluationPassed(null);
     setMicPermissionDenied(false);
 
-    // Requirement 4: Capture getUserMedia({ audio: true }) strictly for AnalyserNode visualizer
+    // Capture getUserMedia({ audio: true }) strictly for AnalyserNode green volume visualizer
     try {
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -540,7 +614,7 @@ export default function App() {
       return;
     }
 
-    // Requirement 1, 2, 3: Configure SpeechRecognition with auto-restart loop on onend
+    // Configure SpeechRecognition with resilient auto-restart loop on onend
     isRecordingRef.current = true;
     setMicState("listening");
 
@@ -592,9 +666,9 @@ export default function App() {
         .trim();
 
       if (fullTranscript) {
+        latestTranscriptRef.current = fullTranscript;
         setLiveTranscript(fullTranscript);
 
-        // Automatically stop after 3 seconds of silence once spoken words have been captured
         clearPostSpeechTimer();
         postSpeechSilenceTimerRef.current = window.setTimeout(() => {
           if (isRecordingRef.current) {
@@ -627,7 +701,6 @@ export default function App() {
     };
 
     recognition.onend = () => {
-      // Preserve any finalized text from this session before restarting
       if (
         currentSessionFinalRef.current ||
         currentSessionInterimRef.current
@@ -643,7 +716,6 @@ export default function App() {
         currentSessionInterimRef.current = "";
       }
 
-      // Requirement 1: Auto-restart loop if recording is still active
       if (isRecordingRef.current) {
         try {
           recognition.start();
@@ -661,29 +733,55 @@ export default function App() {
   }, [
     clearPostSpeechTimer,
     isPlayingAudio,
+    isSentenceComplete,
     micState,
     stopVisualizerAndRecognition,
   ]);
 
   const handleSelectFood = (foodId: FoodId) => {
     setSelectedFood(foodId);
-    setHasChosenFood(true);
-    const foodObj = FOOD_OPTIONS.find((f) => f.id === foodId);
-    if (currentStep === 2 && foodObj) {
-      setSelectedReason(foodObj.defaultReason);
+    if (currentStep === 1) {
+      setInitialFoodId(foodId);
+      // Set a sensible default alternative for Step 3
+      setNegotiatedFoodId(foodId === "tteokbokki" ? "pizza" : "tteokbokki");
+    } else if (currentStep === 3) {
+      setNegotiatedFoodId(foodId);
     }
-    setHasCreatedTargetSentence(true);
     setCurrentFeedback(null);
+    setEvaluationPassed(null);
   };
 
   const handleSelectReason = (reasonId: ReasonId) => {
-    if (currentStep !== 2 && selectedReason === reasonId) {
-      setSelectedReason(null);
-    } else {
-      setSelectedReason(reasonId);
-    }
-    setHasCreatedTargetSentence(true);
+    setSelectedReason(reasonId);
     setCurrentFeedback(null);
+    setEvaluationPassed(null);
+  };
+
+  const handleSelectPlace = (placeId: PlaceId) => {
+    setSelectedPlace(placeId);
+    setCurrentFeedback(null);
+    setEvaluationPassed(null);
+  };
+
+  const handleSelectClosing = (closingId: ClosingId) => {
+    setSelectedClosing(closingId);
+    setCurrentFeedback(null);
+    setEvaluationPassed(null);
+  };
+
+  const handleResetChoices = () => {
+    stopVisualizerAndRecognition();
+    setSelectedFood(null);
+    setSelectedReason(null);
+    setSelectedPlace(null);
+    setSelectedClosing(null);
+    setLiveTranscript("");
+    latestTranscriptRef.current = "";
+    setCurrentFeedback(null);
+    setEvaluationPassed(null);
+    setMatchedKeywords([]);
+    setMissingKeywords([]);
+    setMicState("ready");
   };
 
   const handleTryAgain = () => {
@@ -692,17 +790,19 @@ export default function App() {
     committedFinalRef.current = "";
     currentSessionFinalRef.current = "";
     currentSessionInterimRef.current = "";
+    latestTranscriptRef.current = "";
     alternativesAccumulatorRef.current = [];
     setCurrentFeedback(null);
+    setEvaluationPassed(null);
     setMicState("ready");
   };
 
   const handleNextPhase = () => {
-    if (!hasCreatedTargetSentence) return;
+    if (!isSentenceComplete || evaluationPassed !== true) return;
     stopVisualizerAndRecognition();
 
     if (!turnRecords.some((r) => r.step === currentStep)) {
-      const partnerQ = stepConfig.partnerLine(currentFoodObj);
+      const partnerQ = stepConfig.partnerLine(conversationCtx);
       const defaultRecord: TurnRecord = {
         step: currentStep,
         partnerQuestion: partnerQ,
@@ -719,7 +819,7 @@ export default function App() {
           strategyLabel: "Completed",
           situation: "success",
         },
-        foodId: selectedFood,
+        foodId: activeFoodId,
         reasonId: selectedReason,
       };
       setTurnRecords((prev) =>
@@ -739,6 +839,8 @@ export default function App() {
   const handleStartPractice = () => {
     setPartnerIndex((prev) => (prev + 1) % PARTNER_PROFILES.length);
     setTurnRecords([]);
+    setInitialFoodId("pizza");
+    setNegotiatedFoodId("tteokbokki");
     setCurrentStep(1);
     initializeStepDefaults(1);
     setScreen("practice");
@@ -746,6 +848,48 @@ export default function App() {
 
   const completedCount = turnRecords.length;
   const earnedStars = completedCount >= 5 ? 3 : completedCount >= 3 ? 2 : 1;
+
+  // Compute visible repair helper text when a mistake occurs (Recast / Elicitation / Chunking)
+  const getRepairPracticePrompt = (): {
+    badge: string;
+    practiceText: string;
+  } | null => {
+    if (!currentFeedback || evaluationPassed) return null;
+    const firstMissing = missingKeywords[0] || "because";
+    const firstLetter = firstMissing.charAt(0).toLowerCase();
+    const maskedSentence = dynamicTarget.sentence.replace(
+      new RegExp(`\\b${firstMissing}\\b`, "i"),
+      `${firstLetter}__`
+    );
+    const words = dynamicTarget.sentence.replace(/[.!?]+$/, "").split(/\s+/);
+    const chunkWords =
+      words.length > 3 ? words.slice(-4).join(" ") : words.join(" ");
+
+    if (currentFeedback.situation === "fail_1_recast") {
+      return {
+        badge: "1st Correction — Recast (Say the full sentence)",
+        practiceText: dynamicTarget.sentence,
+      };
+    }
+    if (currentFeedback.situation === "fail_2_elicitation") {
+      return {
+        badge: `2nd Correction — Elicitation (Hint: starts with "${firstLetter.toUpperCase()}")`,
+        practiceText: maskedSentence,
+      };
+    }
+    if (currentFeedback.situation === "fail_3_chunking") {
+      return {
+        badge: "3rd Correction — Chunking (Repeat this short chunk)",
+        practiceText: `${chunkWords}.`,
+      };
+    }
+    return {
+      badge: "Try Speaking Again",
+      practiceText: dynamicTarget.sentence,
+    };
+  };
+
+  const repairPrompt = getRepairPracticePrompt();
 
   const renderHighlightedSentence = (sentence: string, keywords: string[]) => {
     const words = sentence.split(" ");
@@ -757,6 +901,11 @@ export default function App() {
       const isMatched = matchedKeywords.some((kw) =>
         kw.toLowerCase().split(" ").includes(cleanWord)
       );
+      const isMissing =
+        evaluationPassed === false &&
+        missingKeywords.some((kw) =>
+          kw.toLowerCase().split(" ").includes(cleanWord)
+        );
 
       return (
         <span
@@ -764,6 +913,8 @@ export default function App() {
           className={`inline-block mr-1.5 transition-colors ${
             isMatched
               ? "text-emerald-700 underline decoration-emerald-500 decoration-2 underline-offset-4"
+              : isMissing
+              ? "text-rose-700 bg-rose-100 px-1.5 rounded-md underline decoration-rose-500 decoration-2 underline-offset-4"
               : isKey
               ? "text-amber-700 underline decoration-amber-400 decoration-2 underline-offset-4"
               : "text-slate-900"
@@ -805,7 +956,7 @@ export default function App() {
 
       <main className="flex-1 w-full max-w-xl mx-auto px-4 py-6 sm:py-8 flex flex-col justify-center">
         {/* =========================================================
-            SCREEN 1: START SCREEN
+            SCREEN 1: START SCREEN (HOME)
            ========================================================= */}
         {screen === "start" && (
           <section className="bg-white rounded-3xl border border-slate-200 p-6 sm:p-8 flex flex-col justify-between shadow-xs space-y-6">
@@ -827,15 +978,15 @@ export default function App() {
               <FriendsWalkingIllustration />
             </div>
 
-            {/* Bottom: Large Start Talking button + Small privacy notice right at the bottom */}
+            {/* Bottom: Primary Entry Button labeled "Start" + Small privacy notice */}
             <div className="space-y-3">
               <button
                 type="button"
                 onClick={handleStartPractice}
-                className="w-full min-h-[56px] py-4 px-6 rounded-2xl bg-amber-600 hover:bg-amber-700 active:scale-[0.99] text-white font-display font-bold text-lg sm:text-xl flex items-center justify-center gap-3 shadow-sm transition-all cursor-pointer"
+                className="w-full min-h-[56px] py-4 px-6 rounded-2xl bg-amber-600 hover:bg-amber-700 active:scale-[0.99] text-white font-display font-bold text-lg sm:text-xl flex items-center justify-center gap-2.5 shadow-sm transition-all cursor-pointer"
               >
-                <Mic className="w-6 h-6" />
-                <span>Start Talking</span>
+                <span>Start</span>
+                <ArrowRight className="w-5 h-5" />
               </button>
 
               <p className="text-center text-xs text-slate-500">
@@ -847,14 +998,14 @@ export default function App() {
         )}
 
         {/* =========================================================
-            SCREEN 2: PRACTICE SCREEN
+            SCREEN 2: SENTENCE SELECTION & PRACTICE SCREEN
            ========================================================= */}
         {screen === "practice" && (
           <section className="bg-white rounded-3xl border border-slate-200 p-5 sm:p-7 shadow-xs space-y-5">
             {/* TOP: Progress Indicator (Step X/5) + Partner Character Speech Bubble */}
             <div className="space-y-3">
               <div className="flex items-center justify-between text-xs sm:text-sm font-bold text-slate-800 tabular-nums">
-                <span>Step {currentStep}/5</span>
+                <span>{stepConfig.stageTitle}</span>
                 <div className="flex items-center gap-1.5">
                   {[1, 2, 3, 4, 5].map((n) => (
                     <span
@@ -883,7 +1034,7 @@ export default function App() {
                       type="button"
                       disabled={micState === "listening"}
                       onClick={() =>
-                        speakText(stepConfig.partnerLine(currentFoodObj), 0.9)
+                        speakText(stepConfig.partnerLine(conversationCtx), 0.9)
                       }
                       className="min-h-[32px] px-2.5 py-1 rounded-lg bg-white border border-slate-200 hover:bg-slate-100 text-xs font-medium text-slate-700 flex items-center gap-1 transition-colors disabled:opacity-50 cursor-pointer whitespace-nowrap shrink-0"
                     >
@@ -892,214 +1043,458 @@ export default function App() {
                     </button>
                   </div>
                   <p className="mt-1 text-base sm:text-lg font-bold text-slate-900">
-                    &ldquo;{stepConfig.partnerLine(currentFoodObj)}&rdquo;
+                    &ldquo;{stepConfig.partnerLine(conversationCtx)}&rdquo;
                   </p>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    {stepConfig.partnerKorean(currentFoodObj)}
+                    {stepConfig.partnerKorean(conversationCtx)}
                   </p>
                 </div>
               </div>
             </div>
 
-            {/* MIDDLE: 3 Food Visual Cards + Reason Tag Selector + Target Sentence Area */}
+            {/* MIDDLE: Coherent Turn-by-Turn Choice Options (disappear once chosen) */}
             <div className="space-y-4">
-              {/* 3 Food Visual Cards */}
-              <div className="grid grid-cols-3 gap-2.5">
-                {FOOD_OPTIONS.map((food) => {
-                  const isSelected = selectedFood === food.id;
-                  return (
-                    <button
-                      key={food.id}
-                      type="button"
-                      onClick={() => handleSelectFood(food.id)}
-                      className={`rounded-2xl p-3 text-center transition-all flex flex-col items-center justify-center border cursor-pointer min-h-[96px] ${
-                        isSelected
-                          ? "bg-amber-50/90 border-amber-500 ring-2 ring-amber-500/20"
-                          : "bg-white border-slate-200 hover:bg-slate-50"
-                      }`}
-                    >
-                      <FoodIllustration
-                        foodId={food.id}
-                        className="w-11 h-11"
-                      />
-                      <span className="mt-1.5 font-bold text-sm text-slate-900 whitespace-nowrap">
-                        {food.title}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
+              {!isSentenceComplete ? (
+                <>
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold text-slate-600">
+                      {stepConfig.selectionPrompt}
+                    </p>
 
-              {/* Reason Tag Selector (Appears after food choice) */}
-              {hasChosenFood && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {REASON_OPTIONS.map((reason) => {
-                    const isActive = selectedReason === reason.id;
-                    return (
-                      <button
-                        key={reason.id}
-                        type="button"
-                        onClick={() => handleSelectReason(reason.id)}
-                        className={`min-h-[38px] px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer whitespace-nowrap shrink-0 border ${
-                          isActive
-                            ? "bg-slate-900 text-white border-slate-900"
-                            : "bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200/70"
-                        }`}
-                      >
-                        {reason.label}
-                      </button>
-                    );
-                  })}
+                    {/* STEP 1: Choose initial food ("I want to eat [food] tonight.") */}
+                    {currentStep === 1 && (
+                      <div className="grid grid-cols-3 gap-2.5">
+                        {FOOD_OPTIONS.map((food) => {
+                          const isSelected = selectedFood === food.id;
+                          return (
+                            <button
+                              key={food.id}
+                              type="button"
+                              onClick={() => handleSelectFood(food.id)}
+                              className={`rounded-2xl p-3 text-center transition-all flex flex-col items-center justify-center border cursor-pointer min-h-[100px] ${
+                                isSelected
+                                  ? "bg-amber-50/90 border-amber-500 ring-2 ring-amber-500/20"
+                                  : "bg-white border-slate-200 hover:bg-slate-50"
+                              }`}
+                            >
+                              <FoodIllustration
+                                foodId={food.id}
+                                className="w-11 h-11"
+                              />
+                              <span className="mt-1.5 font-bold text-sm text-slate-900 whitespace-nowrap">
+                                {food.title}
+                              </span>
+                              <span className="text-[11px] text-slate-500">
+                                {food.korean}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* STEP 2: Choose reason for Step 1's food ("I want to eat [food] because it is [reason].") */}
+                    {currentStep === 2 && (
+                      <div className="space-y-2.5">
+                        <div className="flex items-center gap-2.5 px-3 py-2 rounded-xl bg-amber-50/70 border border-amber-200">
+                          <FoodIllustration
+                            foodId={initialFoodId}
+                            className="w-8 h-8"
+                          />
+                          <span className="text-xs font-semibold text-amber-950">
+                            Explaining why you want{" "}
+                            <span className="font-bold underline">
+                              {initialFoodId}
+                            </span>
+                            :
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                          {REASON_OPTIONS.map((reason) => {
+                            const isActive = selectedReason === reason.id;
+                            return (
+                              <button
+                                key={reason.id}
+                                type="button"
+                                onClick={() => handleSelectReason(reason.id)}
+                                className={`min-h-[48px] px-3 py-2 rounded-xl text-left transition-all cursor-pointer border flex flex-col justify-center ${
+                                  isActive
+                                    ? "bg-slate-900 text-white border-slate-900"
+                                    : "bg-white text-slate-800 border-slate-200 hover:bg-slate-50"
+                                }`}
+                              >
+                                <span className="text-xs sm:text-sm font-bold">
+                                  {reason.label}
+                                </span>
+                                <span
+                                  className={`text-[11px] ${
+                                    isActive
+                                      ? "text-slate-300"
+                                      : "text-slate-500"
+                                  }`}
+                                >
+                                  {reason.korean}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* STEP 3: Partner ate Step 1's food yesterday -> Suggest another food instead */}
+                    {currentStep === 3 && (
+                      <div className="grid grid-cols-3 gap-2.5">
+                        {FOOD_OPTIONS.map((food) => {
+                          const isAteYesterday = food.id === initialFoodId;
+                          const isSelected = selectedFood === food.id;
+                          return (
+                            <button
+                              key={food.id}
+                              type="button"
+                              disabled={isAteYesterday}
+                              onClick={() => handleSelectFood(food.id)}
+                              className={`rounded-2xl p-3 text-center transition-all flex flex-col items-center justify-center border min-h-[104px] ${
+                                isAteYesterday
+                                  ? "bg-slate-100 border-slate-200 opacity-45 cursor-not-allowed"
+                                  : isSelected
+                                  ? "bg-amber-50/90 border-amber-500 ring-2 ring-amber-500/20 cursor-pointer"
+                                  : "bg-white border-slate-200 hover:bg-slate-50 cursor-pointer"
+                              }`}
+                            >
+                              <FoodIllustration
+                                foodId={food.id}
+                                className="w-11 h-11"
+                              />
+                              <span className="mt-1.5 font-bold text-sm text-slate-900 whitespace-nowrap">
+                                {food.title}
+                              </span>
+                              <span className="text-[10px] text-slate-500">
+                                {isAteYesterday
+                                  ? "Ate yesterday"
+                                  : food.korean}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* STEP 4: Partner asks if there's a good place near here -> Choose place response */}
+                    {currentStep === 4 && (
+                      <div className="grid grid-cols-1 gap-2.5">
+                        {PLACE_OPTIONS.map((place) => {
+                          const isSelected = selectedPlace === place.id;
+                          return (
+                            <button
+                              key={place.id}
+                              type="button"
+                              onClick={() => handleSelectPlace(place.id)}
+                              className={`rounded-2xl p-3.5 text-left transition-all border cursor-pointer flex items-center justify-between gap-3 ${
+                                isSelected
+                                  ? "bg-amber-50 border-amber-500 ring-2 ring-amber-500/20"
+                                  : "bg-white border-slate-200 hover:bg-slate-50"
+                              }`}
+                            >
+                              <div>
+                                <p className="text-sm font-bold text-slate-900">
+                                  {place.label}
+                                </p>
+                                <p className="text-xs text-slate-500 mt-0.5">
+                                  {place.korean}
+                                </p>
+                              </div>
+                              <ArrowRight className="w-4 h-4 text-amber-600 shrink-0" />
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* STEP 5: Partner asks "Perfect! Should we go there?" -> Choose final agreement */}
+                    {currentStep === 5 && (
+                      <div className="grid grid-cols-1 gap-2.5">
+                        {CLOSING_OPTIONS.map((closing) => {
+                          const isSelected = selectedClosing === closing.id;
+                          return (
+                            <button
+                              key={closing.id}
+                              type="button"
+                              onClick={() => handleSelectClosing(closing.id)}
+                              className={`rounded-2xl p-3.5 text-left transition-all border cursor-pointer flex items-center justify-between gap-3 ${
+                                isSelected
+                                  ? "bg-amber-50 border-amber-500 ring-2 ring-amber-500/20"
+                                  : "bg-white border-slate-200 hover:bg-slate-50"
+                              }`}
+                            >
+                              <div>
+                                <p className="text-sm font-bold text-slate-900">
+                                  {closing.label}
+                                </p>
+                                <p className="text-xs text-slate-500 mt-0.5">
+                                  {closing.korean}
+                                </p>
+                              </div>
+                              <ArrowRight className="w-4 h-4 text-amber-600 shrink-0" />
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Prompt while sentence is incomplete */}
+                  <div className="rounded-2xl bg-slate-50 border border-dashed border-slate-300 p-4 text-center">
+                    <p className="text-sm font-semibold text-slate-700">
+                      Select or complete your sentence to start speaking.
+                    </p>
+                  </div>
+                </>
+              ) : (
+                /* Completed Target Sentence Area (Options hidden to reduce screen clutter) */
+                <div className="rounded-2xl bg-amber-50/60 border border-amber-200/90 p-4 sm:p-5 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-amber-900">
+                      Your Target Sentence
+                    </span>
+                    <button
+                      type="button"
+                      disabled={micState === "listening"}
+                      onClick={handleResetChoices}
+                      className="text-xs font-semibold text-slate-600 hover:text-slate-900 flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/80 border border-slate-200 hover:bg-white cursor-pointer disabled:opacity-40"
+                    >
+                      <Edit3 className="w-3.5 h-3.5" />
+                      <span>Change choice</span>
+                    </button>
+                  </div>
+
+                  <p className="text-2xl sm:text-3xl font-bold font-display leading-snug tracking-tight text-slate-900">
+                    &ldquo;
+                    {renderHighlightedSentence(
+                      dynamicTarget.sentence,
+                      dynamicTarget.keywords
+                    )}
+                    &rdquo;
+                  </p>
+                  <p className="text-xs sm:text-sm text-slate-600">
+                    {dynamicTarget.korean}
+                  </p>
+
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      disabled={micState === "listening"}
+                      onClick={() => speakText(dynamicTarget.sentence, 0.9)}
+                      className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-amber-300 hover:bg-amber-100/60 text-xs font-semibold text-slate-900 flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <Volume2 className="w-4 h-4 text-amber-700" />
+                      <span>Listen</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={micState === "listening"}
+                      onClick={() => speakText(dynamicTarget.sentence, 0.7)}
+                      className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-amber-300 hover:bg-amber-100/60 text-xs font-semibold text-slate-900 flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer whitespace-nowrap shrink-0"
+                    >
+                      <Turtle className="w-4 h-4 text-amber-700" />
+                      <span>Slow</span>
+                    </button>
+                  </div>
                 </div>
               )}
-
-              {/* Target Sentence Area (Largest Text + Listen Buttons) */}
-              <div className="rounded-2xl bg-amber-50/60 border border-amber-200/90 p-4 sm:p-5">
-                <p className="text-2xl sm:text-3xl font-bold font-display leading-snug tracking-tight text-slate-900">
-                  &ldquo;
-                  {renderHighlightedSentence(
-                    dynamicTarget.sentence,
-                    dynamicTarget.keywords
-                  )}
-                  &rdquo;
-                </p>
-                <p className="mt-1 text-xs sm:text-sm text-slate-600">
-                  {dynamicTarget.korean}
-                </p>
-
-                <div className="mt-3 flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={micState === "listening"}
-                    onClick={() => speakText(dynamicTarget.sentence, 0.9)}
-                    className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-amber-300 hover:bg-amber-100/60 text-xs font-semibold text-slate-900 flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    <Volume2 className="w-4 h-4 text-amber-700" />
-                    <span>Listen</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={micState === "listening"}
-                    onClick={() => speakText(dynamicTarget.sentence, 0.7)}
-                    className="min-h-[38px] px-3 py-1.5 rounded-xl bg-white border border-amber-300 hover:bg-amber-100/60 text-xs font-semibold text-slate-900 flex items-center gap-1.5 transition-colors disabled:opacity-50 cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    <Turtle className="w-4 h-4 text-amber-700" />
-                    <span>Slow</span>
-                  </button>
-                </div>
-              </div>
             </div>
 
-            {/* BOTTOM: Large Round Mic Button + Live Volume Visualizer + Real-Time Spoken Text + Feedback Card */}
-            <div className="pt-2 border-t border-slate-100 space-y-4">
-              <div className="flex flex-col items-center">
-                <button
-                  type="button"
-                  disabled={isPlayingAudio || micState === "transcribing"}
-                  onClick={handleMicToggle}
-                  style={
-                    micState === "listening"
-                      ? {
-                          transform: `scale(${1 + (volumeLevel / 100) * 0.16})`,
-                        }
-                      : undefined
-                  }
-                  aria-label={
-                    micState === "listening"
-                      ? "Listening - Tap to finish speaking"
-                      : micState === "transcribing"
-                      ? "Transcribing speech"
-                      : "Tap to Speak"
-                  }
-                  className={`w-24 h-24 rounded-full flex flex-col items-center justify-center gap-1 text-white font-display font-bold shadow-md transition-transform duration-75 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
-                    micState === "listening"
-                      ? "bg-emerald-600 hover:bg-emerald-700 ring-8 ring-emerald-500/25"
-                      : micState === "transcribing"
-                      ? "bg-blue-600 ring-8 ring-blue-500/20"
-                      : micState === "error"
-                      ? "bg-red-600 hover:bg-red-700"
-                      : "bg-slate-500 hover:bg-slate-600 active:scale-95"
-                  }`}
-                >
-                  {micState === "transcribing" ? (
-                    <>
-                      <Sparkles className="w-7 h-7" />
-                      <span className="text-xs">Transcribing...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Mic className="w-8 h-8" />
-                      <span className="text-xs">
-                        {micState === "listening"
-                          ? "Tap Done"
-                          : micState === "error"
-                          ? "Error"
-                          : "Tap to Speak"}
+            {/* PROMINENT FEEDBACK & REPAIR CARD (Recast -> Elicitation -> Chunking) */}
+            {currentFeedback && (
+              <div
+                ref={feedbackCardRef}
+                role="region"
+                aria-label="Speaking feedback and correction"
+                className={`rounded-2xl p-4 sm:p-5 border-2 shadow-sm transition-all ${
+                  evaluationPassed
+                    ? "bg-emerald-50 border-emerald-400"
+                    : "bg-rose-50 border-rose-500 ring-4 ring-rose-500/20"
+                }`}
+              >
+                <div className="flex items-start gap-3.5">
+                  <CoachAvatar className="w-12 h-12" />
+                  <div className="flex-1 min-w-0 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span
+                        className={`text-xs font-bold uppercase tracking-wide px-2 py-0.5 rounded-md ${
+                          evaluationPassed
+                            ? "bg-emerald-200/70 text-emerald-900"
+                            : "bg-rose-200 text-rose-950"
+                        }`}
+                      >
+                        {repairPrompt
+                          ? repairPrompt.badge
+                          : currentFeedback.strategyLabel}
                       </span>
-                    </>
-                  )}
-                </button>
 
-                {/* On-Screen State Indicator & Reactive Green Volume Bar */}
-                <div className="mt-3 w-full max-w-xs flex flex-col items-center gap-1.5">
-                  <span
-                    className={`text-xs font-semibold ${
+                      <button
+                        type="button"
+                        disabled={micState === "listening"}
+                        onClick={() =>
+                          speakText(
+                            repairPrompt
+                              ? dynamicTarget.sentence
+                              : currentFeedback.english,
+                            0.9
+                          )
+                        }
+                        className="min-h-[32px] px-2.5 py-1 rounded-lg bg-white border border-slate-300 hover:bg-slate-100 text-xs font-semibold text-slate-800 flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
+                      >
+                        <Volume2 className="w-3.5 h-3.5 text-rose-700" />
+                        <span>Hear Correction</span>
+                      </button>
+                    </div>
+
+                    <p className="text-base sm:text-lg font-bold text-slate-900 leading-snug">
+                      {currentFeedback.english}
+                    </p>
+                    <p className="text-xs sm:text-sm font-medium text-slate-700">
+                      ({currentFeedback.korean})
+                    </p>
+
+                    {/* Reminder box when Success + small word missing (PRD Section 7) */}
+                    {evaluationPassed === true &&
+                      currentFeedback.situation === "partial" &&
+                      missingKeywords.length > 0 && (
+                        <div className="mt-2 rounded-xl bg-white border border-emerald-300 p-3 space-y-1">
+                          <p className="text-xs font-bold text-emerald-800 uppercase tracking-wide">
+                            Small word(s) to remember next time:
+                          </p>
+                          <p className="text-sm font-bold text-slate-900">
+                            &ldquo;{missingKeywords.join(", ")}&rdquo; &rarr;{" "}
+                            <span className="text-emerald-800">
+                              {dynamicTarget.sentence}
+                            </span>
+                          </p>
+                        </div>
+                      )}
+
+                    {/* High-visibility Correction Practice Box for Recast / Elicitation / Chunking */}
+                    {repairPrompt && (
+                      <div className="mt-2 rounded-xl bg-white border-2 border-rose-400 p-3.5 space-y-1.5">
+                        <p className="text-xs font-bold text-rose-700 uppercase tracking-wide">
+                          Correction — Try saying this:
+                        </p>
+                        <p className="text-xl sm:text-2xl font-bold font-display text-slate-900">
+                          &ldquo;{repairPrompt.practiceText}&rdquo;
+                        </p>
+                        {missingKeywords.length > 0 && (
+                          <p className="text-xs text-rose-800 font-semibold">
+                            Key word(s) to include:{" "}
+                            <span className="underline font-bold">
+                              {missingKeywords.join(", ")}
+                            </span>
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* BOTTOM: Conditional Microphone Visibility + Post-Recording Highlighted Actions */}
+            <div className="pt-2 border-t border-slate-100 space-y-4">
+              {isSentenceComplete ? (
+                <div className="flex flex-col items-center">
+                  <button
+                    type="button"
+                    disabled={isPlayingAudio}
+                    onClick={handleMicToggle}
+                    style={
                       micState === "listening"
-                        ? "text-emerald-700"
-                        : micState === "transcribing"
-                        ? "text-blue-700"
+                        ? {
+                            transform: `scale(${1 + (volumeLevel / 100) * 0.16})`,
+                          }
+                        : undefined
+                    }
+                    aria-label={
+                      micState === "listening"
+                        ? "Listening - Tap to finish speaking"
+                        : "Tap to Speak"
+                    }
+                    className={`w-24 h-24 rounded-full flex flex-col items-center justify-center gap-1 text-white font-display font-bold shadow-md transition-transform duration-75 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed ${
+                      micState === "listening"
+                        ? "bg-emerald-600 hover:bg-emerald-700 ring-8 ring-emerald-500/25"
                         : micState === "error"
-                        ? "text-red-600"
-                        : "text-slate-500"
+                        ? "bg-red-600 hover:bg-red-700"
+                        : "bg-slate-600 hover:bg-slate-700 active:scale-95"
                     }`}
                   >
-                    {micState === "listening"
-                      ? "Listening... Speak clearly, then tap mic or pause 3s"
-                      : micState === "transcribing"
-                      ? "Checking your sentence..."
-                      : micState === "error"
-                      ? "Error accessing microphone"
-                      : "Ready"}
-                  </span>
+                    <Mic className="w-8 h-8" />
+                    <span className="text-xs">
+                      {micState === "listening"
+                        ? "Tap Done"
+                        : micState === "error"
+                        ? "Error"
+                        : "Tap to Speak"}
+                    </span>
+                  </button>
 
-                  {micState === "listening" && (
-                    <div
-                      className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden"
-                      aria-label="Microphone volume meter"
+                  {/* On-Screen State Indicator & Reactive Green Volume Bar */}
+                  <div className="mt-3 w-full max-w-xs flex flex-col items-center gap-1.5">
+                    <span
+                      className={`text-xs font-semibold ${
+                        micState === "listening"
+                          ? "text-emerald-700"
+                          : micState === "error"
+                          ? "text-red-600"
+                          : "text-slate-500"
+                      }`}
                     >
+                      {micState === "listening"
+                        ? "Listening... Speak clearly, then tap mic or pause 3s"
+                        : micState === "error"
+                        ? "Error accessing microphone"
+                        : evaluationPassed === true
+                        ? "Sentence verified! You can go to the next step."
+                        : "Tap the mic and say your sentence to unlock Go Next"}
+                    </span>
+
+                    {micState === "listening" && (
                       <div
-                        className="h-full bg-emerald-500 transition-all duration-75"
-                        style={{ width: `${Math.max(8, volumeLevel)}%` }}
-                      />
-                    </div>
-                  )}
+                        className="w-full h-2.5 bg-slate-200 rounded-full overflow-hidden"
+                        aria-label="Microphone volume meter"
+                      >
+                        <div
+                          className="h-full bg-emerald-500 transition-all duration-75"
+                          style={{ width: `${Math.max(8, volumeLevel)}%` }}
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Real-Time Spoken Text Display */}
+                  <div className="mt-2 min-h-[28px] text-center">
+                    {liveTranscript ? (
+                      <p className="text-base font-semibold text-slate-900">
+                        You said: &ldquo;{liveTranscript}&rdquo;
+                      </p>
+                    ) : null}
+                  </div>
+
+                  {/* Optional Keyboard Fallback toggle */}
+                  <button
+                    type="button"
+                    onClick={() => setShowManualInput((prev) => !prev)}
+                    className="mt-1 text-[11px] text-slate-400 hover:text-slate-600 flex items-center gap-1 cursor-pointer"
+                  >
+                    <Keyboard className="w-3 h-3" />
+                    <span>
+                      {showManualInput
+                        ? "Hide keyboard input"
+                        : "Type or test response"}
+                    </span>
+                  </button>
                 </div>
+              ) : null}
 
-                {/* Real-Time Spoken Text Display */}
-                <div className="mt-2 min-h-[28px] text-center">
-                  {liveTranscript ? (
-                    <p className="text-base font-semibold text-slate-900">
-                      &ldquo;{liveTranscript}&rdquo;
-                    </p>
-                  ) : null}
-                </div>
-
-                {/* Optional Keyboard Fallback toggle */}
-                <button
-                  type="button"
-                  onClick={() => setShowManualInput((prev) => !prev)}
-                  className="mt-1 text-[11px] text-slate-400 hover:text-slate-600 flex items-center gap-1 cursor-pointer"
-                >
-                  <Keyboard className="w-3 h-3" />
-                  <span>
-                    {showManualInput
-                      ? "Hide keyboard input"
-                      : "Type or test response"}
-                  </span>
-                </button>
-              </div>
-
-              {showManualInput && (
+              {showManualInput && isSentenceComplete && (
                 <div className="rounded-2xl bg-slate-50 border border-slate-200 p-3 space-y-2">
                   <form
                     onSubmit={(e) => {
@@ -1128,52 +1523,52 @@ export default function App() {
                 </div>
               )}
 
-              {/* Feedback Card (Appears after speaking with Coach avatar) */}
-              {currentFeedback && (
-                <div
-                  role="region"
-                  aria-label="Speaking feedback card"
-                  className={`rounded-2xl p-4 border ${
-                    currentFeedback.situation === "success" ||
-                    currentFeedback.situation === "partial"
-                      ? "bg-emerald-50/70 border-emerald-200"
-                      : "bg-amber-50/80 border-amber-200"
-                  }`}
-                >
-                  <div className="flex items-start gap-3">
-                    <CoachAvatar className="w-11 h-11" />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm sm:text-base font-bold text-slate-900">
-                        {currentFeedback.english}
-                      </p>
-                      <p className="mt-0.5 text-xs sm:text-sm text-slate-700">
-                        ({currentFeedback.korean})
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Action Buttons: [Try Again] [Next Phase →] */}
+              {/* Post-Recording Action Buttons: Go Next is ONLY available after evaluationPassed === true */}
               <div className="flex items-center justify-between gap-3 pt-1">
                 <button
                   type="button"
+                  disabled={!isSentenceComplete || micState === "listening"}
                   onClick={handleTryAgain}
-                  className="min-h-[46px] px-4 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 font-semibold text-sm flex items-center justify-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  className={`min-h-[48px] px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-40 disabled:cursor-not-allowed ${
+                    evaluationPassed === false
+                      ? "flex-1 bg-amber-600 hover:bg-amber-700 text-white shadow-sm ring-4 ring-amber-400/40"
+                      : "border border-slate-300 bg-white hover:bg-slate-50 text-slate-800"
+                  }`}
                 >
                   <RotateCcw className="w-4 h-4" />
-                  <span>Try Again</span>
+                  <span>
+                    {evaluationPassed === false
+                      ? "Record Again"
+                      : "Try Again"}
+                  </span>
                 </button>
 
                 <button
                   type="button"
                   disabled={
-                    !hasCreatedTargetSentence || micState === "listening"
+                    !isSentenceComplete ||
+                    evaluationPassed !== true ||
+                    micState === "listening"
                   }
                   onClick={handleNextPhase}
-                  className="flex-1 min-h-[46px] px-5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:bg-slate-200 disabled:text-slate-400 text-white font-semibold text-sm flex items-center justify-center gap-2 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  className={`min-h-[48px] px-5 py-2.5 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer whitespace-nowrap shrink-0 disabled:bg-slate-200 disabled:text-slate-400 disabled:ring-0 disabled:cursor-not-allowed ${
+                    evaluationPassed === true
+                      ? "flex-1 bg-emerald-600 hover:bg-emerald-700 text-white shadow-md ring-4 ring-emerald-400/50"
+                      : "flex-1 bg-slate-200 text-slate-400"
+                  }`}
                 >
-                  <span>{currentStep < 5 ? "Next Phase" : "See Results"}</span>
+                  {evaluationPassed === true && (
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                  )}
+                  <span>
+                    {evaluationPassed === true
+                      ? currentStep < 5
+                        ? "Great job! Go Next"
+                        : "Great job! See Results"
+                      : currentStep < 5
+                      ? "Go Next (Speak Correct Sentence First)"
+                      : "See Results (Speak Correct Sentence First)"}
+                  </span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
               </div>
@@ -1189,7 +1584,7 @@ export default function App() {
             {/* TOP: Celebration Graphic + "Dinner Choice Finalized!" Header */}
             <div className="text-center space-y-2">
               <div className="inline-flex items-center justify-center w-18 h-18 rounded-3xl bg-amber-100 text-amber-700 mx-auto">
-                <FoodIllustration foodId={selectedFood} className="w-12 h-12" />
+                <FoodIllustration foodId={activeFoodId} className="w-12 h-12" />
               </div>
 
               <h1 className="text-2xl sm:text-3xl font-bold text-slate-900 font-display tracking-tight">
@@ -1220,10 +1615,14 @@ export default function App() {
             <div className="divide-y divide-slate-100 border-t border-b border-slate-200">
               {DIALOGUE_STEPS.map((stepItem) => {
                 const rec = turnRecords.find((r) => r.step === stepItem.step);
+                const fallbackTarget = buildDynamicTarget(
+                  stepItem.step,
+                  stepItem.step <= 2 ? initialFoodId : negotiatedFoodId,
+                  rec?.reasonId || null
+                );
                 const targetSent =
-                  rec?.targetSentence || stepItem.canonicalSentence;
-                const spokenSent =
-                  rec?.spokenText || stepItem.canonicalSentence;
+                  rec?.targetSentence || fallbackTarget.sentence;
+                const spokenSent = rec?.spokenText || fallbackTarget.sentence;
 
                 return (
                   <div
@@ -1232,7 +1631,8 @@ export default function App() {
                   >
                     <div className="min-w-0">
                       <p className="text-xs text-slate-500 tabular-nums">
-                        Step {stepItem.step}
+                        Step {stepItem.step} &bull;{" "}
+                        {stepItem.partnerLine(conversationCtx)}
                       </p>
                       <p className="text-sm sm:text-base font-bold text-slate-900 truncate">
                         &ldquo;{spokenSent}&rdquo;

@@ -1,9 +1,41 @@
-export type FoodId = "pizza" | "tteokbokki" | "burger";
-export type ReasonId = "chewy" | "spicy" | "cheesy" | "hot" | "cheap" | "delicious";
+export type FoodId =
+  | "pizza"
+  | "tteokbokki"
+  | "burger"
+  | "chicken"
+  | "ramen"
+  | "kimbap";
+
+export type ReasonId =
+  | "chewy"
+  | "delicious"
+  | "spicy"
+  | "cheesy"
+  | "hot"
+  | "cheap"
+  | "crispy"
+  | "sweet"
+  | "salty"
+  | "fresh"
+  | "juicy"
+  | "filling";
+
+export type PlaceId =
+  | "famous_school"
+  | "popular_station"
+  | "good_park"
+  | "popular_mall";
+
+export type ClosingId =
+  | "go_eat_there"
+  | "go_right_now"
+  | "go_together"
+  | "cant_wait";
 
 export interface FoodOption {
   id: FoodId;
   title: string;
+  spokenName: string;
   korean: string;
   defaultReason: ReasonId;
 }
@@ -12,6 +44,24 @@ export interface ReasonOption {
   id: ReasonId;
   label: string;
   korean: string;
+}
+
+export interface PlaceOption {
+  id: PlaceId;
+  label: string;
+  korean: string;
+  sentence: string;
+  koreanSentence: string;
+  keywords: string[];
+}
+
+export interface ClosingOption {
+  id: ClosingId;
+  label: string;
+  korean: string;
+  sentence: string;
+  koreanSentence: string;
+  keywords: string[];
 }
 
 export interface PartnerProfile {
@@ -27,97 +77,216 @@ export const PARTNER_PROFILES: PartnerProfile[] = [
   { name: "Yuna", koreanName: "유나", role: "Friend" },
 ];
 
+// Doubled to 6 Food Options
 export const FOOD_OPTIONS: FoodOption[] = [
   {
     id: "pizza",
     title: "Pizza",
+    spokenName: "pizza",
     korean: "피자",
     defaultReason: "chewy",
   },
   {
     id: "tteokbokki",
     title: "Tteokbokki",
+    spokenName: "tteokbokki",
     korean: "떡볶이",
     defaultReason: "spicy",
   },
   {
     id: "burger",
     title: "Burger",
+    spokenName: "burger",
     korean: "햄버거",
     defaultReason: "cheesy",
   },
+  {
+    id: "chicken",
+    title: "Chicken",
+    spokenName: "chicken",
+    korean: "치킨",
+    defaultReason: "crispy",
+  },
+  {
+    id: "ramen",
+    title: "Ramen",
+    spokenName: "ramen",
+    korean: "라면",
+    defaultReason: "hot",
+  },
+  {
+    id: "kimbap",
+    title: "Kimbap",
+    spokenName: "kimbap",
+    korean: "김밥",
+    defaultReason: "cheap",
+  },
 ];
 
+// Doubled to 12 Reason Options
 export const REASON_OPTIONS: ReasonOption[] = [
+  { id: "chewy", label: "Chewy", korean: "쫄깃해서" },
+  { id: "delicious", label: "Delicious", korean: "맛있어서" },
   { id: "spicy", label: "Spicy", korean: "매콤해서" },
   { id: "cheesy", label: "Cheesy", korean: "치즈가 많아서" },
   { id: "hot", label: "Hot", korean: "따뜻해서" },
   { id: "cheap", label: "Cheap", korean: "저렴해서" },
-  { id: "chewy", label: "Chewy", korean: "쫄깃해서" },
-  { id: "delicious", label: "Delicious", korean: "맛있어서" },
+  { id: "crispy", label: "Crispy", korean: "바삭해서" },
+  { id: "sweet", label: "Sweet", korean: "달콤해서" },
+  { id: "salty", label: "Salty", korean: "짭짤해서" },
+  { id: "fresh", label: "Fresh", korean: "신선해서" },
+  { id: "juicy", label: "Juicy", korean: "육즙이 많아서" },
+  { id: "filling", label: "Filling", korean: "배불러서" },
 ];
+
+// Doubled to 4 Place Options (Step 4)
+export const PLACE_OPTIONS: PlaceOption[] = [
+  {
+    id: "famous_school",
+    label: "Famous shop near our school",
+    korean: "우리 학교 근처에 유명한 가게",
+    sentence: "Yes, there is a famous shop near our school.",
+    koreanSentence: "응, 우리 학교 근처에 유명한 가게가 있어.",
+    keywords: ["famous", "shop", "near"],
+  },
+  {
+    id: "popular_station",
+    label: "Famous shop near the station",
+    korean: "역 근처에 유명한 가게",
+    sentence: "Yes, there is a famous shop near the station.",
+    koreanSentence: "응, 역 근처에 유명한 가게가 있어.",
+    keywords: ["famous", "shop", "near"],
+  },
+  {
+    id: "good_park",
+    label: "Good restaurant near the park",
+    korean: "공원 근처에 좋은 식당",
+    sentence: "Yes, there is a good restaurant near the park.",
+    koreanSentence: "응, 공원 근처에 좋은 식당이 있어.",
+    keywords: ["good", "restaurant", "near"],
+  },
+  {
+    id: "popular_mall",
+    label: "Popular place near the mall",
+    korean: "쇼핑몰 근처에 인기 있는 가게",
+    sentence: "Yes, there is a popular place near the mall.",
+    koreanSentence: "응, 쇼핑몰 근처에 인기 있는 가게가 있어.",
+    keywords: ["popular", "place", "near"],
+  },
+];
+
+// Doubled to 4 Closing Options (Step 5)
+export const CLOSING_OPTIONS: ClosingOption[] = [
+  {
+    id: "go_eat_there",
+    label: "Yeah, let's go eat there!",
+    korean: "좋아 지금 거기로 먹으러 가자!",
+    sentence: "Yeah let's go eat there.",
+    koreanSentence: "좋아 지금 가자.",
+    keywords: ["let's", "go"],
+  },
+  {
+    id: "go_right_now",
+    label: "Yeah, let's go right now!",
+    korean: "응 지금 바로 가자!",
+    sentence: "Yeah let's go right now.",
+    koreanSentence: "응 지금 바로 가자.",
+    keywords: ["let's", "go"],
+  },
+  {
+    id: "go_together",
+    label: "Sounds great, let's go together!",
+    korean: "좋아 우리 같이 가자!",
+    sentence: "Sounds great let's go together.",
+    koreanSentence: "좋아 우리 같이 가자.",
+    keywords: ["let's", "go"],
+  },
+  {
+    id: "cant_wait",
+    label: "Awesome, let's go eat now!",
+    korean: "최고야 지금 먹으러 가자!",
+    sentence: "Awesome let's go eat now.",
+    koreanSentence: "최고야 지금 먹으러 가자.",
+    keywords: ["let's", "go"],
+  },
+];
+
+export interface ConversationContext {
+  initialFoodId: FoodId;
+  negotiatedFoodId: FoodId;
+}
 
 export interface DialogueStepConfig {
   step: number;
-  partnerLine: (selectedFood: FoodOption) => string;
-  partnerKorean: (selectedFood: FoodOption) => string;
-  canonicalSentence: string;
-  canonicalKorean: string;
-  canonicalKeywords: string[];
-  recommendedFood: FoodId;
-  recommendedReason: ReasonId;
+  stageTitle: string;
+  selectionPrompt: string;
+  partnerLine: (ctx: ConversationContext) => string;
+  partnerKorean: (ctx: ConversationContext) => string;
+}
+
+function getFoodById(id: FoodId): FoodOption {
+  return FOOD_OPTIONS.find((f) => f.id === id) || FOOD_OPTIONS[0];
 }
 
 export const DIALOGUE_STEPS: DialogueStepConfig[] = [
   {
     step: 1,
-    partnerLine: () => "What do you want to eat tonight?",
+    stageTitle: "Step 1/5: State what you want to eat",
+    selectionPrompt: "Choose what you want to eat tonight (6 options):",
+    partnerLine: () => "What do you want to eat?",
     partnerKorean: () => "오늘 저녁으로 뭐 먹고 싶어?",
-    canonicalSentence: "I want to eat pizza tonight.",
-    canonicalKorean: "나 오늘 저녁으로 피자 먹고 싶어.",
-    canonicalKeywords: ["want", "pizza"],
-    recommendedFood: "pizza",
-    recommendedReason: "chewy",
   },
   {
     step: 2,
-    partnerLine: (food) => `Oh, ${food.title.toLowerCase()}? Why do you want to eat that?`,
-    partnerKorean: (food) => `오, ${food.korean}? 왜 그게 먹고 싶어?`,
-    canonicalSentence: "I want to eat pizza because it is chewy.",
-    canonicalKorean: "피자가 쫄깃해서 먹고 싶어.",
-    canonicalKeywords: ["pizza", "because", "chewy"],
-    recommendedFood: "pizza",
-    recommendedReason: "chewy",
+    stageTitle: "Step 2/5: Explain your reason",
+    selectionPrompt: "Why do you want to eat that? Choose a reason (12 options):",
+    partnerLine: (ctx) => {
+      const f = getFoodById(ctx.initialFoodId);
+      return `Oh, ${f.spokenName}? Why do you want to eat that?`;
+    },
+    partnerKorean: (ctx) => {
+      const f = getFoodById(ctx.initialFoodId);
+      return `오, ${f.korean}? 왜 그게 먹고 싶어?`;
+    },
   },
   {
     step: 3,
-    partnerLine: () => "But I ate pizza yesterday! How about something hot and spicy?",
-    partnerKorean: () => "근데 나 어제 피자 먹었어! 따뜻하고 매콤한 건 어때?",
-    canonicalSentence: "Then how about eating tteokbokki instead?",
-    canonicalKorean: "그럼 대신에 떡볶이 먹는 건 어때?",
-    canonicalKeywords: ["how about", "tteokbokki"],
-    recommendedFood: "tteokbokki",
-    recommendedReason: "spicy",
+    stageTitle: "Step 3/5: Suggest another food",
+    selectionPrompt: "Suggest a different food instead:",
+    partnerLine: (ctx) => {
+      const f = getFoodById(ctx.initialFoodId);
+      if (f.id === "tteokbokki" || f.id === "ramen") {
+        return `But I ate ${f.spokenName} yesterday! How about something crispy or cheesy?`;
+      }
+      return `But I ate ${f.spokenName} yesterday! How about something hot and spicy?`;
+    },
+    partnerKorean: (ctx) => {
+      const f = getFoodById(ctx.initialFoodId);
+      if (f.id === "tteokbokki" || f.id === "ramen") {
+        return `근데 나 어제 ${f.korean} 먹었어! 바삭하거나 치즈가 들어간 건 어때?`;
+      }
+      return `근데 나 어제 ${f.korean} 먹었어! 따뜻하고 매콤한 건 어때?`;
+    },
   },
   {
     step: 4,
-    partnerLine: (food) => `${food.title} sounds good, but is there a good place near here?`,
-    partnerKorean: (food) => `${food.korean} 좋다! 근데 이 근처에 괜찮은 가게가 있어?`,
-    canonicalSentence: "Yes, there is a famous shop near our school.",
-    canonicalKorean: "응, 우리 학교 근처에 유명한 가게가 있어.",
-    canonicalKeywords: ["famous", "shop", "near"],
-    recommendedFood: "tteokbokki",
-    recommendedReason: "spicy",
+    stageTitle: "Step 4/5: Recommend a place nearby",
+    selectionPrompt: "Choose a place to recommend (4 options):",
+    partnerLine: (ctx) => {
+      const f = getFoodById(ctx.negotiatedFoodId);
+      return `${f.title} sounds good, but is there a good place near here?`;
+    },
+    partnerKorean: (ctx) => {
+      const f = getFoodById(ctx.negotiatedFoodId);
+      return `${f.korean} 좋다! 근데 이 근처에 괜찮은 가게가 있어?`;
+    },
   },
   {
     step: 5,
+    stageTitle: "Step 5/5: Finalize the dinner plan",
+    selectionPrompt: "Choose how to agree and wrap up (4 options):",
     partnerLine: () => "Perfect! Should we go there?",
     partnerKorean: () => "완벽해! 우리 거기로 갈까?",
-    canonicalSentence: "Yeah let's go eat there.",
-    canonicalKorean: "좋아 지금 가자.",
-    canonicalKeywords: ["let's", "go"],
-    recommendedFood: "tteokbokki",
-    recommendedReason: "spicy",
   },
 ];
 
@@ -149,6 +318,9 @@ const SYNONYM_MAP: Record<string, string[]> = {
     "teriyaki",
   ],
   burger: ["burger", "burgers", "hamburger", "햄버거", "버거"],
+  chicken: ["chicken", "chickens", "fried chicken", "치킨"],
+  ramen: ["ramen", "ramyeon", "noodle", "noodles", "라면"],
+  kimbap: ["kimbap", "gimbap", "kim bap", "gim bap", "김밥"],
   because: ["because", "cause", "cuz", "cos", "bcz", "be cause"],
   chewy: [
     "chewy",
@@ -159,18 +331,25 @@ const SYNONYM_MAP: Record<string, string[]> = {
     "tree",
     "chilly",
     "cherry",
-    "delicious",
-    "yummy",
-    "tasty",
   ],
-  delicious: ["delicious", "chewy", "yummy", "tasty", "good"],
+  delicious: ["delicious", "yummy", "tasty"],
   spicy: ["spicy", "spice", "spicie", "spiky"],
   cheesy: ["cheesy", "cheese", "cheesie", "easy"],
   hot: ["hot", "warm", "heart", "hat"],
   cheap: ["cheap", "cheep", "chip", "inexpensive"],
+  crispy: ["crispy", "crisp", "crunchy"],
+  sweet: ["sweet", "suite"],
+  salty: ["salty", "salt"],
+  fresh: ["fresh", "flash"],
+  juicy: ["juicy", "juice"],
+  filling: ["filling", "full", "feeling"],
   "how about": ["how about", "how bout", "what about"],
   famous: ["famous", "popular", "good", "great"],
+  popular: ["popular", "famous", "good"],
+  good: ["good", "great", "famous", "nice"],
   shop: ["shop", "place", "store", "restaurant", "spot", "sharp"],
+  restaurant: ["restaurant", "shop", "place", "store"],
+  place: ["place", "shop", "spot", "restaurant"],
   near: ["near", "close", "around", "by", "here"],
   "let's": ["let's", "lets", "let us", "let"],
   go: ["go", "eat", "head"],
@@ -179,89 +358,79 @@ const SYNONYM_MAP: Record<string, string[]> = {
 export function buildDynamicTarget(
   step: number,
   foodId: FoodId,
-  reasonId: ReasonId | null
+  reasonId: ReasonId | null,
+  placeId: PlaceId | null = "famous_school",
+  closingId: ClosingId | null = "go_eat_there"
 ): DynamicSentenceResult {
-  const food = FOOD_OPTIONS.find((f) => f.id === foodId) || FOOD_OPTIONS[0];
-  const reason = REASON_OPTIONS.find((r) => r.id === reasonId) || null;
+  const food = getFoodById(foodId);
+  const reason =
+    REASON_OPTIONS.find((r) => r.id === reasonId) ||
+    REASON_OPTIONS.find((r) => r.id === food.defaultReason) ||
+    REASON_OPTIONS[0];
 
+  // Step 1 (PRD Turn 1): "I want to eat pizza tonight."
   if (step === 1) {
-    if (reason) {
-      return {
-        sentence: `I want to eat ${food.id} because it is ${reason.id}.`,
-        korean: `나 ${food.korean}가 ${reason.korean} 먹고 싶어.`,
-        keywords: ["want", food.id, "because", reason.id],
-        acceptedSynonyms: SYNONYM_MAP,
-      };
-    }
     return {
-      sentence: `I want to eat ${food.id} tonight.`,
+      sentence: `I want to eat ${food.spokenName} tonight.`,
       korean: `나 오늘 저녁으로 ${food.korean} 먹고 싶어.`,
       keywords: ["want", food.id],
       acceptedSynonyms: SYNONYM_MAP,
     };
   }
 
+  // Step 2 (PRD Turn 2): "I want to eat pizza because it is chewy."
   if (step === 2) {
-    const activeReason = reason || REASON_OPTIONS.find((r) => r.id === food.defaultReason) || REASON_OPTIONS[4];
     return {
-      sentence: `I want to eat ${food.id} because it is ${activeReason.id}.`,
-      korean: `${food.korean}가 ${activeReason.korean} 먹고 싶어.`,
-      keywords: [food.id, "because", activeReason.id],
+      sentence: `I want to eat ${food.spokenName} because it is ${reason.id}.`,
+      korean: `${food.korean}가 ${reason.korean} 먹고 싶어.`,
+      keywords: [food.id, "because", reason.id],
       acceptedSynonyms: SYNONYM_MAP,
     };
   }
 
+  // Step 3 (PRD Turn 3): "Then how about eating tteokbokki instead?"
   if (step === 3) {
-    if (reason) {
-      return {
-        sentence: `Then how about eating ${food.id} because it is ${reason.id}?`,
-        korean: `그럼 ${reason.korean} 대신에 ${food.korean} 먹는 건 어때?`,
-        keywords: ["how about", food.id, reason.id],
-        acceptedSynonyms: SYNONYM_MAP,
-      };
-    }
     return {
-      sentence: `Then how about eating ${food.id} instead?`,
+      sentence: `Then how about eating ${food.spokenName} instead?`,
       korean: `그럼 대신에 ${food.korean} 먹는 건 어때?`,
       keywords: ["how about", food.id],
       acceptedSynonyms: SYNONYM_MAP,
     };
   }
 
+  // Step 4 (PRD Turn 4): "Yes, there is a famous shop near our school."
   if (step === 4) {
-    if (reason) {
-      return {
-        sentence: `Yes, there is a famous ${food.id} shop near our school.`,
-        korean: `응, 우리 학교 근처에 유명한 ${food.korean} 가게가 있어.`,
-        keywords: ["famous", "shop", "near"],
-        acceptedSynonyms: SYNONYM_MAP,
-      };
-    }
+    const place =
+      PLACE_OPTIONS.find((p) => p.id === placeId) || PLACE_OPTIONS[0];
     return {
-      sentence: "Yes, there is a famous shop near our school.",
-      korean: "응, 우리 학교 근처에 유명한 가게가 있어.",
-      keywords: ["famous", "shop", "near"],
+      sentence: place.sentence,
+      korean: place.koreanSentence,
+      keywords: place.keywords,
       acceptedSynonyms: SYNONYM_MAP,
     };
   }
 
-  // Step 5
-  if (reason) {
-    return {
-      sentence: `Yeah let's go eat ${food.id} there.`,
-      korean: `좋아 지금 거기서 ${food.korean} 먹으러 가자.`,
-      keywords: ["let's", "go"],
-      acceptedSynonyms: SYNONYM_MAP,
-    };
-  }
+  // Step 5 (PRD Turn 5): "Yeah let's go eat there."
+  const closing =
+    CLOSING_OPTIONS.find((c) => c.id === closingId) || CLOSING_OPTIONS[0];
   return {
-    sentence: "Yeah let's go eat there.",
-    korean: "좋아 지금 가자.",
-    keywords: ["let's", "go"],
+    sentence: closing.sentence,
+    korean: closing.koreanSentence,
+    keywords: closing.keywords,
     acceptedSynonyms: SYNONYM_MAP,
   };
 }
 
+/**
+ * Evaluates student speech against the target sentence following Section 7 of the PRD:
+ * - "success": All target keywords AND supporting words are spoken -> Passes
+ * - "partial" ("Success + small word missing"): All core keywords are spoken, only minor/small words (e.g., "tonight", "instead", "there", "our") are missing -> Passes
+ * - Mistakes (when any core keyword is missing -> passed: false):
+ *   1. Severity-based + consecutive repair progression:
+ *      - "fail_1_recast": Moderate error on 1st attempt (at least 1 keyword or partial phrase spoken, or 1st fail) -> models full target sentence
+ *      - "fail_2_elicitation": Missing the connector/reasoning word (e.g., "because" -> "b__") or 2nd consecutive fail -> prompts with first letter
+ *      - "fail_3_chunking": Severe error (0 keywords matched in a short/fragmented attempt on retry, or 3rd+ consecutive fail) -> breaks into short chunks
+ */
 export function evaluateSpeech(
   spokenText: string,
   target: DynamicSentenceResult,
@@ -310,54 +479,50 @@ export function evaluateSpeech(
     }
   }
 
-  // All key words matched
-  if (missingKeywords.length === 0) {
-    return {
-      situation: "success",
-      matchedKeywords,
-      missingKeywords: [],
-      passed: true,
-    };
-  }
-
-  // Main idea communicated (most key words matched or at least 1 key word in a 3+ word utterance)
-  const wordCount = spokenText
-    .trim()
+  // Check if any small/supporting words from the target sentence were omitted
+  const targetAllWords = target.sentence
+    .toLowerCase()
+    .replace(/[.,!?"]/g, "")
     .split(/\s+/)
-    .filter(Boolean).length;
-  if (
-    matchedKeywords.length > 0 &&
-    matchedKeywords.length >= Math.ceil(target.keywords.length * 0.5) &&
-    wordCount >= 3
-  ) {
-    return {
-      situation: "partial",
-      matchedKeywords,
-      missingKeywords,
-      passed: true,
-    };
+    .filter(Boolean);
+
+  const missingSmallWords = targetAllWords.filter((w) => {
+    const isPartOfKeyword = target.keywords.some((kw) =>
+      kw.toLowerCase().split(" ").includes(w)
+    );
+    if (isPartOfKeyword) return false;
+    return !combinedPool.includes(w);
+  });
+
+  // 1. All core keywords matched!
+  if (missingKeywords.length === 0) {
+    if (missingSmallWords.length === 0) {
+      return {
+        situation: "success",
+        matchedKeywords,
+        missingKeywords: [],
+        passed: true,
+      };
+    } else {
+      // "Success + small word missing" from PRD Section 7 Table
+      return {
+        situation: "partial",
+        matchedKeywords,
+        missingKeywords: missingSmallWords.slice(0, 2),
+        passed: true,
+      };
+    }
   }
 
-  // Repair sequence on consecutive failures:
-  // 1st fail -> Recast
-  // 2nd fail -> Elicitation (with first letter)
-  // 3rd+ fail -> Chunking
-  const failIndex = consecutiveFailures + 1;
-  if (failIndex === 1) {
-    return {
-      situation: "fail_1_recast",
-      matchedKeywords,
-      missingKeywords,
-      passed: false,
-    };
-  } else if (failIndex === 2) {
-    return {
-      situation: "fail_2_elicitation",
-      matchedKeywords,
-      missingKeywords,
-      passed: false,
-    };
-  } else {
+  // 2. Core keyword(s) missing -> Error (passed: false).
+  // Determine correction strategy based on PRD rules & mistake severity:
+  const matchRatio = matchedKeywords.length / Math.max(1, target.keywords.length);
+
+  // Severe error (0 keywords matched after already failing once, or 3rd+ consecutive failure) -> Chunking
+  if (
+    consecutiveFailures >= 2 ||
+    (matchedKeywords.length === 0 && consecutiveFailures >= 1)
+  ) {
     return {
       situation: "fail_3_chunking",
       matchedKeywords,
@@ -365,4 +530,27 @@ export function evaluateSpeech(
       passed: false,
     };
   }
+
+  // Missing "because" while other words matched (exact PRD Elicitation rule), or 2nd consecutive failure -> Elicitation with first letter
+  if (
+    consecutiveFailures === 1 ||
+    (missingKeywords.length === 1 &&
+      missingKeywords[0] === "because" &&
+      matchRatio >= 0.5)
+  ) {
+    return {
+      situation: "fail_2_elicitation",
+      matchedKeywords,
+      missingKeywords,
+      passed: false,
+    };
+  }
+
+  // Default 1st failure / moderate mistake -> Recast
+  return {
+    situation: "fail_1_recast",
+    matchedKeywords,
+    missingKeywords,
+    passed: false,
+  };
 }

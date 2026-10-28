@@ -190,6 +190,80 @@ export const FoodIllustration: React.FC<{ foodId: FoodId; className?: string }> 
     );
   }
 
+  if (foodId === "chicken") {
+    return (
+      <svg viewBox="0 0 64 64" fill="none" className={className} aria-hidden="true">
+        <circle cx="32" cy="32" r="28" fill="#FEF3C7" />
+        {/* Bone handle */}
+        <path
+          d="M17 45 L25 37"
+          stroke="#F8FAFC"
+          strokeWidth="6"
+          strokeLinecap="round"
+        />
+        <circle cx="15" cy="47" r="4" fill="#F8FAFC" stroke="#CBD5E1" strokeWidth="1.5" />
+        <circle cx="19" cy="49" r="4" fill="#F8FAFC" stroke="#CBD5E1" strokeWidth="1.5" />
+        {/* Crispy golden drumstick body */}
+        <path
+          d="M23 39 C19 31, 29 15, 42 17 C51 18, 53 29, 45 38 C38 45, 27 44, 23 39 Z"
+          fill="#D97706"
+          stroke="#92400E"
+          strokeWidth="2.2"
+        />
+        <path d="M32 23 Q37 21 41 25" stroke="#FDE68A" strokeWidth="2.2" strokeLinecap="round" />
+        <path d="M29 32 Q34 35 39 32" stroke="#FDE68A" strokeWidth="2" strokeLinecap="round" />
+      </svg>
+    );
+  }
+
+  if (foodId === "ramen") {
+    return (
+      <svg viewBox="0 0 64 64" fill="none" className={className} aria-hidden="true">
+        <circle cx="32" cy="32" r="28" fill="#FEE2E2" />
+        {/* Chopsticks */}
+        <path d="M20 14 L48 20" stroke="#78350F" strokeWidth="2.5" strokeLinecap="round" />
+        <path d="M20 19 L48 22" stroke="#78350F" strokeWidth="2.5" strokeLinecap="round" />
+        {/* Wavy noodles */}
+        <path d="M22 23 Q24 28 22 33" stroke="#FACC15" strokeWidth="2.5" strokeLinecap="round" />
+        <path d="M28 22 Q30 28 28 33" stroke="#FACC15" strokeWidth="2.5" strokeLinecap="round" />
+        <path d="M34 22 Q36 28 34 33" stroke="#FACC15" strokeWidth="2.5" strokeLinecap="round" />
+        {/* Half-boiled egg */}
+        <ellipse cx="42" cy="31" rx="5" ry="3.5" fill="#FFFFFF" stroke="#CBD5E1" strokeWidth="1.5" />
+        <circle cx="42" cy="31" r="2" fill="#F59E0B" />
+        {/* Ramen Bowl */}
+        <path
+          d="M12 33 H52 L46 49 C44 52, 20 52, 18 49 Z"
+          fill="#DC2626"
+          stroke="#991B1B"
+          strokeWidth="2.2"
+          strokeLinejoin="round"
+        />
+        <path d="M16 38 H48" stroke="#FCA5A5" strokeWidth="2" strokeLinecap="round" />
+      </svg>
+    );
+  }
+
+  if (foodId === "kimbap") {
+    return (
+      <svg viewBox="0 0 64 64" fill="none" className={className} aria-hidden="true">
+        <circle cx="32" cy="32" r="28" fill="#ECFDF5" />
+        {/* Back kimbap slice */}
+        <circle cx="23" cy="27" r="12" fill="#1E293B" />
+        <circle cx="23" cy="27" r="9.5" fill="#F8FAFC" />
+        <circle cx="21" cy="25" r="2.5" fill="#F97316" />
+        <circle cx="25" cy="25" r="2.5" fill="#FACC15" />
+        <circle cx="23" cy="29" r="2.5" fill="#16A34A" />
+        {/* Front kimbap slice */}
+        <circle cx="38" cy="36" r="13" fill="#0F172A" stroke="#334155" strokeWidth="1.5" />
+        <circle cx="38" cy="36" r="10" fill="#FFFFFF" />
+        <circle cx="35" cy="34" r="2.8" fill="#EF4444" />
+        <circle cx="41" cy="34" r="2.8" fill="#FACC15" />
+        <circle cx="36" cy="39" r="2.6" fill="#16A34A" />
+        <circle cx="41" cy="39" r="2.6" fill="#EA580C" />
+      </svg>
+    );
+  }
+
   return (
     <svg viewBox="0 0 64 64" fill="none" className={className} aria-hidden="true">
       <circle cx="32" cy="32" r="28" fill="#FEF9C3" />
