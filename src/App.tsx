@@ -11,6 +11,10 @@ import {
   Keyboard,
   CheckCircle2,
   Edit3,
+  User,
+  FileSpreadsheet,
+  Loader2,
+  RefreshCw,
 } from "lucide-react";
 import {
   FOOD_OPTIONS,
@@ -37,6 +41,43 @@ import {
   generateFeedbackClientSide,
   getFallbackFeedback,
 } from "./services/geminiClient";
+
+const SCRIPT_URL =
+  "https://script.google.com/macros/s/AKfycbxXc7yAk66ny6c2ku0gD1JcnkDejkyBeWBa1JPF5udNzw7dbnnTCHvKPAfLeajhw8Og/exec";
+const TARGET_SHEET_ID = "1WB8yPbKsqTAfyH-6da0r4HqpqEKSZcLsz_mOUqMHEtc";
+
+export interface SessionData {
+  name: string;
+  play_count: number;
+  correct_count: number;
+  wrong_count: number;
+}
+
+export async function logSessionToSheets(sessionData: SessionData): Promise<boolean> {
+  const payload = {
+    timestamp: new Date().toLocaleString("ko-KR", { timeZone: "Asia/Seoul" }),
+    name: sessionData.name || "Anonymous",
+    play_count: sessionData.play_count,
+    correct_count: sessionData.correct_count,
+    wrong_count: sessionData.wrong_count,
+    sheet_id: TARGET_SHEET_ID,
+  };
+
+  try {
+    await fetch(SCRIPT_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: {
+        "Content-Type": "text/plain;charset=utf-8",
+      },
+      body: JSON.stringify(payload),
+    });
+    return true;
+  } catch (error) {
+    console.error("Failed to log data to Google Sheets:", error);
+    return false;
+  }
+}
 
 type ScreenMode = "start" | "practice" | "result";
 type MicState = "ready" | "listening" | "error";
@@ -118,6 +159,38 @@ declare global {
 export default function App() {
   const [screen, setScreen] = useState<ScreenMode>("start");
   const [partnerIndex, setPartnerIndex] = useState<number>(0);
+
+  // Student identification state (No login required)
+  const [studentName, setStudentName] = useState<string>(() => {
+    try {
+      if (typeof window !== "undefined" && window.localStorage) {
+        return window.localStorage.getItem("speaking_student_name") || "";
+      }
+    } catch {
+      // ignore
+    }
+    return "";
+  });
+
+  // Performance metrics tracking
+  const [playCount, setPlayCount] = useState<number>(0);
+  const [correctCount, setCorrectCount] = useState<number>(0);
+  const [wrongCount, setWrongCount] = useState<number>(0);
+  const [loggingStatus, setLoggingStatus] = useState<
+    "idle" | "logging" | "success" | "error"
+  >("idle");
+  const hasLoggedRef = useRef<boolean>(false);
+
+  const handleNameChange = (val: string) => {
+    setStudentName(val);
+    try {
+      if (typeof window !== "undefined" && window.localStorage) {
+        window.localStorage.setItem("speaking_student_name", val);
+      }
+    } catch {
+      // ignore
+    }
+  };
 
   // Coherent 5-turn conversation state following PRD Section 6
   const [currentStep, setCurrentStep] = useState<number>(1);
@@ -313,6 +386,7 @@ export default function App() {
 
   const speakText = useCallback(
     (text: string, rate: 0.9 | 0.7 = 0.9) => {
+      setPlayCount((prev) => prev + 1);
       if (typeof window === "undefined" || !("speechSynthesis" in window)) {
         return;
       }
@@ -397,10 +471,14 @@ export default function App() {
         situation === "fail_2_elicitation" ||
         situation === "fail_3_chunking";
 
-      if (isFailure) {
-        setConsecutiveFailures((prev) => prev + 1);
-      } else if (passed) {
+      if (passed) {
+        setCorrectCount((prev) => prev + 1);
         setConsecutiveFailures(0);
+      } else {
+        setWrongCount((prev) => prev + 1);
+        if (isFailure) {
+          setConsecutiveFailures((prev) => prev + 1);
+        }
       }
 
       const computedMatched =
@@ -617,6 +695,7 @@ export default function App() {
     // Configure SpeechRecognition with resilient auto-restart loop on onend
     isRecordingRef.current = true;
     setMicState("listening");
+    setPlayCount((prev) => prev + 1);
 
     const recognition = new SpeechRec();
     recognition.continuous = true;
@@ -833,7 +912,31 @@ export default function App() {
       initializeStepDefaults(nextStep);
     } else {
       setScreen("result");
+      const effectiveName = studentName.trim() || "Anonymous";
+      setLoggingStatus("logging");
+      hasLoggedRef.current = true;
+      logSessionToSheets({
+        name: effectiveName,
+        play_count: playCount,
+        correct_count: correctCount,
+        wrong_count: wrongCount,
+      }).then((ok) => {
+        setLoggingStatus(ok ? "success" : "error");
+      });
     }
+  };
+
+  const handleManualReLog = () => {
+    const effectiveName = studentName.trim() || "Anonymous";
+    setLoggingStatus("logging");
+    logSessionToSheets({
+      name: effectiveName,
+      play_count: playCount,
+      correct_count: correctCount,
+      wrong_count: wrongCount,
+    }).then((ok) => {
+      setLoggingStatus(ok ? "success" : "error");
+    });
   };
 
   const handleStartPractice = () => {
@@ -843,6 +946,11 @@ export default function App() {
     setNegotiatedFoodId("tteokbokki");
     setCurrentStep(1);
     initializeStepDefaults(1);
+    setPlayCount(0);
+    setCorrectCount(0);
+    setWrongCount(0);
+    setLoggingStatus("idle");
+    hasLoggedRef.current = false;
     setScreen("practice");
   };
 
@@ -978,6 +1086,34 @@ export default function App() {
               <FriendsWalkingIllustration />
             </div>
 
+            {/* Student Identification Input (No Login Required) */}
+            <div className="bg-amber-50/70 border border-amber-200/90 rounded-2xl p-4 space-y-2">
+              <div className="flex items-center justify-between">
+                <label
+                  htmlFor="student-name-input"
+                  className="text-xs sm:text-sm font-bold text-slate-900 flex items-center gap-1.5"
+                >
+                  <User className="w-4 h-4 text-amber-700" />
+                  <span>Student Name / Nickname (이름 또는 닉네임)</span>
+                </label>
+                <span className="text-[11px] font-semibold text-amber-800 bg-amber-100 px-2 py-0.5 rounded-full">
+                  No login required
+                </span>
+              </div>
+              <input
+                id="student-name-input"
+                type="text"
+                value={studentName}
+                onChange={(e) => handleNameChange(e.target.value)}
+                placeholder="Enter your name (e.g. Minji, Jiho, Alex)"
+                className="w-full px-3.5 py-2.5 rounded-xl bg-white border border-amber-300 text-sm font-medium text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:border-transparent transition-all"
+                maxLength={40}
+              />
+              <p className="text-[11px] text-slate-500">
+                Your practice results will be tracked and logged to the teacher&apos;s Google Sheet under this name.
+              </p>
+            </div>
+
             {/* Bottom: Primary Entry Button labeled "Start" + Small privacy notice */}
             <div className="space-y-3">
               <button
@@ -1002,10 +1138,16 @@ export default function App() {
            ========================================================= */}
         {screen === "practice" && (
           <section className="bg-white rounded-3xl border border-slate-200 p-5 sm:p-7 shadow-xs space-y-5">
-            {/* TOP: Progress Indicator (Step X/5) + Partner Character Speech Bubble */}
+            {/* TOP: Progress Indicator (Step X/5) + Student Name Badge + Partner Character Speech Bubble */}
             <div className="space-y-3">
               <div className="flex items-center justify-between text-xs sm:text-sm font-bold text-slate-800 tabular-nums">
-                <span>{stepConfig.stageTitle}</span>
+                <div className="flex items-center gap-2">
+                  <span>{stepConfig.stageTitle}</span>
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium bg-slate-100 text-slate-600 border border-slate-200">
+                    <User className="w-3 h-3 text-slate-400" />
+                    <span className="truncate max-w-[100px]">{studentName.trim() || "Anonymous"}</span>
+                  </span>
+                </div>
                 <div className="flex items-center gap-1.5">
                   {[1, 2, 3, 4, 5].map((n) => (
                     <span
@@ -1500,6 +1642,7 @@ export default function App() {
                     onSubmit={(e) => {
                       e.preventDefault();
                       if (!manualTextInput.trim()) return;
+                      setPlayCount((prev) => prev + 1);
                       setLiveTranscript(manualTextInput);
                       processSpokenAttempt(manualTextInput);
                       setManualTextInput("");
@@ -1608,6 +1751,101 @@ export default function App() {
                 <p className="mt-1 text-xs font-semibold text-slate-600">
                   Finished the whole dialogue
                 </p>
+              </div>
+            </div>
+
+            {/* GOOGLE SHEETS PERFORMANCE LOG STATUS CARD */}
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 sm:p-5 space-y-3.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 rounded-xl bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+                    <FileSpreadsheet className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider">
+                      Google Sheets Integration
+                    </h3>
+                    <p className="text-xs text-slate-500">
+                      Student:{" "}
+                      <span className="font-semibold text-slate-800">
+                        {studentName.trim() || "Anonymous"}
+                      </span>
+                    </p>
+                  </div>
+                </div>
+
+                {loggingStatus === "logging" && (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Logging...</span>
+                  </span>
+                )}
+                {loggingStatus === "success" && (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Results Logged</span>
+                  </span>
+                )}
+                {loggingStatus === "error" && (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-rose-50 text-rose-700 border border-rose-200">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    <span>Failed</span>
+                  </span>
+                )}
+              </div>
+
+              {/* Metrics Summary Grid */}
+              <div className="grid grid-cols-3 gap-2 text-center">
+                <div className="bg-white rounded-xl p-2.5 border border-slate-200">
+                  <span className="block text-[11px] text-slate-500 font-medium">
+                    Play Count
+                  </span>
+                  <span className="text-lg font-bold text-slate-900 font-display">
+                    {playCount}
+                  </span>
+                </div>
+                <div className="bg-white rounded-xl p-2.5 border border-slate-200">
+                  <span className="block text-[11px] text-emerald-600 font-medium">
+                    Correct Count
+                  </span>
+                  <span className="text-lg font-bold text-emerald-700 font-display">
+                    {correctCount}
+                  </span>
+                </div>
+                <div className="bg-white rounded-xl p-2.5 border border-slate-200">
+                  <span className="block text-[11px] text-amber-600 font-medium">
+                    Wrong / Retries
+                  </span>
+                  <span className="text-lg font-bold text-amber-700 font-display">
+                    {wrongCount}
+                  </span>
+                </div>
+              </div>
+
+              {/* Status footer with retry button */}
+              <div className="flex items-center justify-between text-xs pt-1 border-t border-slate-200/70">
+                <p className="text-slate-600 font-medium">
+                  {loggingStatus === "success"
+                    ? "Session complete! Results logged."
+                    : loggingStatus === "logging"
+                    ? "Sending data to Google Spreadsheet via Apps Script..."
+                    : loggingStatus === "error"
+                    ? "Network notice: Failed to log data to Google Sheets."
+                    : "Session complete! Ready to log."}
+                </p>
+                <button
+                  type="button"
+                  onClick={handleManualReLog}
+                  disabled={loggingStatus === "logging"}
+                  className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 hover:bg-slate-100 text-xs font-semibold text-slate-700 flex items-center gap-1 cursor-pointer disabled:opacity-50 shrink-0 ml-2"
+                >
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 ${
+                      loggingStatus === "logging" ? "animate-spin" : ""
+                    }`}
+                  />
+                  <span>{loggingStatus === "error" ? "Retry" : "Re-log"}</span>
+                </button>
               </div>
             </div>
 

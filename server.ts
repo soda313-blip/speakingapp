@@ -196,6 +196,55 @@ Return JSON with 'english' and 'korean'.`;
 app.post("/api/gemini/feedback", handleFeedbackRoute);
 app.post("/api/feedback", handleFeedbackRoute);
 
+app.post("/api/log-performance", async (req, res) => {
+  const {
+    timestamp = new Date().toISOString(),
+    name = "Student",
+    play_count = 0,
+    correct_count = 0,
+    wrong_count = 0,
+  } = req.body || {};
+
+  console.log(
+    `[Student Performance Log] ${timestamp} | Name: "${name}" | Plays: ${play_count} | Correct: ${correct_count} | Wrong: ${wrong_count}`
+  );
+
+  // If server has GOOGLE_SHEETS_WEBAPP_URL configured, forward payload
+  const sheetsUrl =
+    process.env.GOOGLE_SHEETS_WEBAPP_URL ||
+    process.env.VITE_GOOGLE_SHEETS_WEBAPP_URL;
+
+  if (sheetsUrl) {
+    try {
+      await fetch(sheetsUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          timestamp,
+          name,
+          play_count,
+          correct_count,
+          wrong_count,
+        }),
+      });
+    } catch (sheetErr) {
+      console.warn("Non-critical server-side Google Sheets forward skipped:", sheetErr);
+    }
+  }
+
+  res.json({
+    status: "success",
+    logged: {
+      timestamp,
+      name,
+      play_count,
+      correct_count,
+      wrong_count,
+    },
+    targetSheetId: "1WB8yPbKsqTAfyH-6da0r4HqpqEKSZcLsz_mOUqMHEtc",
+  });
+});
+
 app.post("/api/gemini/transcribe", async (req, res) => {
   const { mimeType = "audio/webm", base64Data = "", targetSentence = "" } =
     req.body || {};
